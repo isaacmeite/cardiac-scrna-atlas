@@ -1,0 +1,121 @@
+---
+title: "Immune Classifier, Step 1: Atlas Data Preparation"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2026-03-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+#Loading required libraries
+suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+    library(yaml)
+    library(ggplot2)
+    library(here)
+})
+
+#Configuration
+cat("Phase 1: Data Preparation & Validation\n")
+
+#Load config 
+config_path <- "/projects/b1246/Isaac/immune_classifier/config/config.yaml"
+if (!file.exists(config_path)) {
+    stop("Config file not found at: ", config_path)
+}
+config <- yaml::read_yaml(config_path)
+
+cat("Configuration loaded\n")
+
+#Load Atlas 
+cat("\n[1/5] Loading cardiac immune atlas...\n")
+
+atlas_path <- config$paths$atlas_seurat
+if (!file.exists(atlas_path)) { 
+    stop("Atlas Seurat object not found at: ", atlas_path)
+}
+
+seurat_atlas <- readRDS(atlas_path)
+
+cat(sprintf("Loaded atlas with %s cells and %s genes\n",
+            format(ncol(seurat_atlas), big.mark = ","),
+            format(nrow(seurat_atlas), big.mark = ",")))
+
+#Verifying Metadata
+cat("\n[2/5] Verifying cell type annotations...\n")
+
+cell_type_col <- config$metadata$cell_type_column
+
+
+# Check column exists
+if (!cell_type_col %in% colnames(seurat_atlas@meta.data)) {
+    available_cols <- paste(colnames(seurat_atlas@meta.data), collapse = ", ")
+    stop(sprintf("Cell type column '%s' not found.\nAvailable columns: %s",
+             cell_type_col, available_cols))
+
+}
+
+#Checking for missing labels 
+missing_labels  <- sum(is.na(seurat_atlas@meta.data[[cell_type_col]]))
+if (missing_labels > 0) {
+    warning(sprintf("%d cells have missing cell type labels. These will be removed.", missing_labels))
+    cells_to_keep <- !is.na(seurat_atlas@meta.data[[cell_type_col]])
+seurat_atlas <- seurat_atlas[, cells_to_keep]
+}
+
+#Displaying cell type composition
+cell_type_counts <- table(seurat_atlas@meta.data[[cell_type_col]])
+cell_type_df <- data.frame(
+    Cell_Type = names(cell_type_counts),
+    Count = as.numeric(cell_type_counts),
+    Percentage = round(100 * as.numeric(cell_type_counts) / ncol(seurat_atlas), 2)
+) %>% arrange(desc(Count))
+
+print(cell_type_df, row.names = FALSE)
+
+cat(sprintf("\n Found %d unique cell types\n", nrow(cell_type_df)))
+
+#Checking rare cell types
+cat("\n[3/5] Checking rare cell types...\n")
+min_cells_per_type <- 100
+rare_types <- cell_type_df %>% filter(Count < min_cells_per_type)
+
+if (nrow(rare_types) >0) {
+    cat("\n Warning: cell types with <100 cells may cause issues in train/test/validate split:\n")
+    print(rare_types, row.names = FALSE)
+}
+
+
+# Standardize Metadata
+cat("\n[4/5] Standardizing metadata...\n")
+
+# Standardized cell type column
+seurat_atlas$cell_type <- seurat_atlas@meta.data[[cell_type_col]]
+
+# Add unique cell IDs
+seurat_atlas$cell_id <- colnames(seurat_atlas)
+
+# Source flag (atlas vs query)
+seurat_atlas$source <- "atlas"
+
+cat("Added standardized metadata columns:\n")
+cat(sprintf("cell_type (from %s)\n", cell_type_col))
+cat("cell_id (unique identifier)\n")
+cat("source (atlas/query flag)\n")
+
+# Save Processed Atlas
+cat("\n[5/5] Saving processed atlas...\n")
+
+output_dir <- file.path(config$paths$data_dir, "processed")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+output_path <- file.path(output_dir, "atlas_processed.rds")
+saveRDS(seurat_atlas, output_path)
+
+cat(sprintf("Saved to: %s\n", output_path))
+cat(sprintf("File size: %.2f MB\n", file.size(output_path) / 1024^2))
+
+```
+
+
