@@ -1,0 +1,917 @@
+---
+title: "MERTK Adult: Custom Classifier vs ImmGen Comparison"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2026-03-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(Seurat)
+library(SingleR)
+library(celldex)
+library(scuttle)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(pheatmap)
+library(ggrepel)
+
+comparison_dir <- "/projects/b1246/Isaac/MERTK/Figures/Classifier_Comparison"
+dir.create(comparison_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+
+```{r Helper Functions definition}
+
+# Base UMAP theme
+umap_pub_theme <- function() {
+  theme_classic(base_size = 11) +
+    theme(
+      plot.title       = element_blank(),
+      axis.line        = element_blank(),
+      axis.ticks       = element_blank(),
+      axis.text        = element_blank(),
+      axis.title       = element_blank(),
+      panel.border     = element_blank(),
+      panel.background = element_blank(),
+      plot.background  = element_blank(),
+      legend.text      = element_text(size = 8, face = "bold"),
+      legend.title     = element_blank(),
+      legend.key.size  = unit(0.35, "cm"),
+      plot.margin      = margin(5, 5, 5, 5)
+    )
+}
+
+# UMAP axis arrows
+add_umap_arrows <- function(umap_df) {
+  x_range   <- diff(range(umap_df$UMAP_1))
+  y_range   <- diff(range(umap_df$UMAP_2))
+  arrow_x   <- 3.0
+  arrow_y   <- arrow_x * (y_range / x_range)
+  list(
+    annotate("segment",
+             x = min(umap_df$UMAP_1)+0.2, xend = min(umap_df$UMAP_1)+0.2+arrow_x,
+             y = min(umap_df$UMAP_2)+0.2, yend = min(umap_df$UMAP_2)+0.2,
+             arrow = arrow(length = unit(0.2,"cm"), type = "closed"),
+             color = "black", linewidth = 0.8),
+    annotate("segment",
+             x = min(umap_df$UMAP_1)+0.2, xend = min(umap_df$UMAP_1)+0.2,
+             y = min(umap_df$UMAP_2)+0.2, yend = min(umap_df$UMAP_2)+0.2+arrow_y,
+             arrow = arrow(length = unit(0.2,"cm"), type = "closed"),
+             color = "black", linewidth = 0.8),
+    annotate("text",
+             x = min(umap_df$UMAP_1)+0.2+arrow_x/2,
+             y = min(umap_df$UMAP_2)-0.5,
+             label = "UMAP-1", size = 3, color = "black",
+             hjust = 0.5, fontface = "bold"),
+    annotate("text",
+             x = min(umap_df$UMAP_1)-0.5,
+             y = min(umap_df$UMAP_2)+0.2+arrow_y/2,
+             label = "UMAP-2", size = 3, color = "black",
+             hjust = 0.5, angle = 90, fontface = "bold")
+  )
+}
+
+# Bar chart theme
+bar_pub_theme <- function() {
+  theme_classic(base_size = 11) +
+    theme(
+      plot.title       = element_blank(),
+      axis.text.x      = element_text(angle = 45, hjust = 1, vjust = 1,
+                                       size = 9, color = "black", face = "bold"),
+      axis.text.y      = element_text(size = 9, color = "black", face = "bold"),
+      axis.title       = element_text(size = 10, color = "black", face = "bold"),
+      axis.line        = element_line(color = "black", linewidth = 0.6),
+      axis.ticks       = element_line(color = "black", linewidth = 0.4),
+      panel.border     = element_blank(),
+      panel.grid       = element_blank(),
+      legend.text      = element_text(size = 9, face = "bold"),
+      legend.title     = element_blank(),
+      legend.key.size  = unit(0.4, "cm"),
+      plot.margin      = margin(10, 10, 5, 10)
+    )
+}
+
+#Save helper (PDF)
+save_pub <- function(p, filename, dir,
+                      width = 180, height = 130) {
+  ggsave(paste0(filename, ".pdf"), plot = p, path = dir,
+         device = "pdf",
+         width = width, height = height, units = "mm")
+}
+
+
+
+```
+
+
+
+```{r Load MERTK adult object and run ImmGen}
+
+# Loading the adult-only integrated object
+seurat_integrated <- readRDS(
+  "/projects/b1246/Isaac/MERTK/v2_adults_only/data/02_integration/seurat_adults_harmony.rds"
+)
+
+cat("Loaded seurat_integrated:", ncol(seurat_integrated), "cells\n")
+cat("Samples:", table(seurat_integrated$sample), "\n")
+
+#Build SCE for ImmGen
+DefaultAssay(seurat_integrated) <- "RNA"
+seurat_integrated <- JoinLayers(seurat_integrated)
+
+expr_counts <- GetAssayData(seurat_integrated, assay = "RNA", layer = "counts")
+expr_counts  <- expr_counts[!duplicated(rownames(expr_counts)), ]
+
+adult_sce <- SingleCellExperiment(assays = list(counts = expr_counts))
+adult_sce <- logNormCounts(adult_sce)
+
+cat("SCE built:", ncol(adult_sce), "cells\n")
+
+# Load ImmGen reference 
+immgen_ref <- celldex::ImmGenData()
+cat("ImmGen reference loaded\n")
+
+#Find common genes
+common_genes <- intersect(rownames(adult_sce), rownames(immgen_ref))
+
+adult_sce_sub  <- adult_sce[common_genes, ]
+immgen_ref_sub <- immgen_ref[common_genes, ]
+
+#Run SingleR with ImmGen 
+pred_immgen <- SingleR(
+  test            = adult_sce_sub,
+  ref             = immgen_ref_sub,
+  labels          = immgen_ref_sub$label.main,
+  assay.type.test = "logcounts",
+  assay.type.ref  = "logcounts"
+)
+
+print(sort(table(pred_immgen$labels), decreasing = TRUE))
+
+#Add ImmGen labels to Seurat object
+seurat_integrated$ImmGen_label <- pred_immgen$labels
+
+
+#Load classifier results and add to seurat_integrated 
+classifier_results <- read.csv(
+  "/projects/b1246/Isaac/MERTK/v2_adults_only/data/03_clustering/classifier_results.csv"
+)
+
+print(head(classifier_results))
+
+# Set rownames to cell IDs for indexing
+rownames(classifier_results) <- classifier_results$cell_id
+
+#Check overlap with seurat_integrated
+common_cells <- intersect(colnames(seurat_integrated),
+                           classifier_results$cell_id)
+
+# Add classifier labels back to seurat_integrated
+seurat_integrated$classifier_label <- classifier_results[
+  colnames(seurat_integrated), "predicted_celltype"
+]
+seurat_integrated$classifier_prob <- classifier_results[
+  colnames(seurat_integrated), "max_probability"
+]
+
+print(sort(table(seurat_integrated$classifier_label), decreasing = TRUE))
+
+
+```
+
+
+
+```{r Comparison dataframe}
+
+# Extract UMAP coordinates
+umap_df <- as.data.frame(Embeddings(seurat_integrated, "umap"))
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+
+comp_df <- data.frame(
+  cell_id         = colnames(seurat_integrated),
+  UMAP_1          = umap_df$UMAP_1,
+  UMAP_2          = umap_df$UMAP_2,
+  sample          = seurat_integrated$sample,
+  custom_label    = seurat_integrated$classifier_label,
+  custom_prob     = seurat_integrated$classifier_prob,
+  immgen_label    = seurat_integrated$ImmGen_label,
+  stringsAsFactors = FALSE
+)
+
+cat("Comparison dataframe built:", nrow(comp_df), "cells\n")
+cat("Custom labels:", length(unique(comp_df$custom_label)), "\n")
+cat("ImmGen labels:", length(unique(comp_df$immgen_label)), "\n")
+
+#Broad category mapping for custom classifier
+custom_to_broad <- c(
+  "CCR2+ Mac"                = "Macrophages",
+  "ARG1+ Mac"                = "Macrophages",
+  "MHCII Mac"                = "Macrophages",
+  "TLF Mac"                  = "Macrophages",
+  "Prolif TLF Mac"           = "Macrophages",
+  "Ly6C-hi Mono"             = "Monocytes",
+  "Ly6C-lo Mono"             = "Monocytes",
+  "Neutrophils"              = "Neutrophils",
+  "DCs"                      = "DCs",
+  "B Cells"                  = "Lymphoid",
+  "NKT"                      = "Lymphoid",
+  "ECs"                      = "Endothelial",
+  "Arterial ECs"             = "Endothelial",
+  "Venous ECs"               = "Endothelial",
+  "Fibroblasts"              = "Fibroblast/Stromal",
+  "Fibroblast progenitors"   = "Fibroblast/Stromal",
+  "RCFs"                     = "Fibroblast/Stromal",
+  "Prolif RCFs"              = "Fibroblast/Stromal",
+  "Transitional fibroblasts" = "Fibroblast/Stromal",
+  "Matrifibrocytes"          = "Fibroblast/Stromal",
+  "Ccl2 fibroblasts"         = "Fibroblast/Stromal",
+  "VSMCs"                    = "VSMCs",
+  "Cardiomyocytes"           = "Cardiomyocytes",
+  "Unassigned"               = "Unassigned"
+)
+
+#Broad category mapping for ImmGen
+normalize_immgen <- function(label) {
+  case_when(
+    grepl("Macrophage",        label, ignore.case = TRUE) ~ "Macrophages",
+    grepl("Monocyte",          label, ignore.case = TRUE) ~ "Monocytes",
+    grepl("Neutrophil",        label, ignore.case = TRUE) ~ "Neutrophils",
+    grepl("Dendritic",         label, ignore.case = TRUE) ~ "DCs",
+    grepl("B cell",            label, ignore.case = TRUE) ~ "Lymphoid",
+    grepl("T cell|NK|NKT|ILC|Tgd", label, ignore.case = TRUE) ~ "Lymphoid",
+    grepl("Endothel",          label, ignore.case = TRUE) ~ "Endothelial",
+    grepl("Fibro|Stromal",     label, ignore.case = TRUE) ~ "Fibroblast/Stromal",
+    grepl("Mast|Basophil|Eosinophil", label, ignore.case = TRUE) ~ "Other Immune",
+    TRUE ~ "Other"
+  )
+}
+
+comp_df$custom_broad <- custom_to_broad[comp_df$custom_label]
+comp_df$custom_broad[is.na(comp_df$custom_broad)] <- "Unassigned"
+comp_df$immgen_broad  <- normalize_immgen(comp_df$immgen_label)
+
+cat("\nCustom broad distribution:\n")
+print(sort(table(comp_df$custom_broad), decreasing = TRUE))
+cat("\nImmGen broad distribution:\n")
+print(sort(table(comp_df$immgen_broad), decreasing = TRUE))
+
+
+
+
+
+
+```
+
+
+```{r Side-by-side UMAP: Custom vs ImmGen}
+
+
+broad_colors <- c(
+  "Macrophages"        = "#C0392B",
+  "Monocytes"          = "#E67E22",
+  "Neutrophils"        = "#0072B2",
+  "DCs"                = "#56B4E9",
+  "Lymphoid"           = "#2980B9",
+  "Endothelial"        = "#27AE60",
+  "Fibroblast/Stromal" = "#8E44AD",
+  "VSMCs"              = "#E91E8C",
+  "Cardiomyocytes"     = "#7A9134",
+  "Other Immune"       = "#95A5A6",
+  "Unassigned"         = "grey80",
+  "Other"              = "grey80"
+)
+
+# Custom classifier UMAP
+centroids_custom <- comp_df %>%
+  filter(custom_broad != "Unassigned") %>%
+  group_by(custom_broad) %>%
+  summarise(UMAP_1 = median(UMAP_1),
+            UMAP_2 = median(UMAP_2), .groups = "drop")
+
+centroids_custom <- centroids_custom %>%
+  mutate(
+    UMAP_1 = case_when(
+      custom_broad == "Lymphoid" ~ UMAP_1 - 2,  # shift left
+      TRUE ~ UMAP_1
+    ),
+    UMAP_2 = case_when(
+      custom_broad == "Lymphoid" ~ UMAP_2 - 8.0,  # shift down
+      TRUE ~ UMAP_2
+    )
+  )
+
+centroids_immgen <- comp_df %>%
+  filter(immgen_broad != "Other") %>%
+  group_by(immgen_broad) %>%
+  summarise(UMAP_1 = median(UMAP_1),
+            UMAP_2 = median(UMAP_2), .groups = "drop")
+
+p_custom_umap <- ggplot(
+  comp_df[order(comp_df$custom_broad == "Unassigned",
+                decreasing = TRUE), ],
+  aes(x = UMAP_1, y = UMAP_2, color = custom_broad)) +
+  geom_point(size = 0.5, alpha = 1.0, stroke = 0) +   
+  scale_color_manual(values = broad_colors,
+                     guide = guide_legend(
+                       override.aes = list(size = 4, alpha = 1),
+                       ncol = 1)) +
+  geom_text_repel(data = centroids_custom,
+                  aes(x = UMAP_1, y = UMAP_2, label = custom_broad),
+                  color = "black", size = 3, fontface = "bold",
+                  box.padding = 0.4, segment.color = "grey50",
+                  segment.size = 0.3, max.overlaps = 20, seed = 42) +
+  umap_pub_theme() +
+  add_umap_arrows(comp_df) 
+
+p_immgen_umap <- ggplot(
+  comp_df[order(comp_df$immgen_broad == "Other",
+                decreasing = TRUE), ],
+  aes(x = UMAP_1, y = UMAP_2, color = immgen_broad)) +
+  geom_point(size = 0.5, alpha = 1.0, stroke = 0) +   
+  scale_color_manual(values = broad_colors,
+                     guide = guide_legend(
+                       override.aes = list(size = 4, alpha = 1),
+                       ncol = 1)) +
+  geom_text_repel(data = centroids_immgen,
+                  aes(x = UMAP_1, y = UMAP_2, label = immgen_broad),
+                  color = "black", size = 3, fontface = "bold",
+                  box.padding = 0.4, segment.color = "grey50",
+                  segment.size = 0.3, max.overlaps = 20, seed = 42) +
+  umap_pub_theme() +
+  add_umap_arrows(comp_df) 
+
+p_umap_comparison <- p_custom_umap | p_immgen_umap
+p_umap_comparison
+
+save_pub(p_umap_comparison, "Fig1_UMAP_Custom_vs_ImmGen",
+         comparison_dir, width = 320, height = 130)
+
+```
+
+
+
+```{r Confusion heatmap: Custom broad vs ImmGen broad}
+
+#Showing agreement and disagreement 
+
+# Only cells assigned by custom classifier
+assigned_cells <- comp_df[comp_df$custom_label != "Unassigned", ]
+
+conf_mat <- prop.table(
+  table(Custom = assigned_cells$custom_broad,
+        ImmGen = assigned_cells$immgen_broad),
+  margin = 1
+)
+
+# Order rows and columns
+row_order <- c("Macrophages","Monocytes","Neutrophils","DCs",
+               "Lymphoid","Endothelial","Fibroblast/Stromal",
+               "VSMCs","Cardiomyocytes")
+col_order <- c("Macrophages","Monocytes","Neutrophils","DCs",
+               "Lymphoid","Endothelial","Fibroblast/Stromal",
+               "Other Immune","Other")
+
+conf_mat <- conf_mat[
+  intersect(row_order, rownames(conf_mat)),
+  intersect(col_order, colnames(conf_mat)),
+  drop = FALSE
+]
+
+# Heatmap
+p_heatmap <- pheatmap(
+  conf_mat,
+  color            = colorRampPalette(c("white","#C0392B"))(100),
+  display_numbers  = round(conf_mat, 2),
+  number_format    = "%.2f",
+  number_color     = "black",
+  fontsize          = 10,
+  fontsize_number   = 9,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  angle_col         = 45,
+  border_color      = "grey90",
+  main              = "",
+  silent            = FALSE
+)
+
+p_heatmap 
+
+save_pub(p_heatmap$gtable, "Fig2_Confusion_Heatmap",
+         comparison_dir, width = 200, height = 160)
+```
+
+
+
+```{r Assignment rate comparison}
+
+# Assignment rates: custom classifier vs ImmGen
+
+# Custom classifier assignment stats
+custom_assigned <- sum(comp_df$custom_label != "Unassigned")
+custom_unassigned <- sum(comp_df$custom_label == "Unassigned")
+
+# ImmGen always assigns 
+immgen_assigned <- nrow(comp_df)
+
+# ImmGen "Macrophage" calls not labeled macrophage by the classifier
+immgen_mac_calls <- comp_df[comp_df$immgen_broad == "Macrophages", ]
+true_macs <- sum(immgen_mac_calls$custom_broad == "Macrophages") 
+false_macs <- sum(immgen_mac_calls$custom_broad != "Macrophages")
+false_mac_pct <- round(false_macs / nrow(immgen_mac_calls) * 100, 1)
+
+cat("=== Assignment Comparison ===\n")
+cat("Custom: assigned", custom_assigned, "/", nrow(comp_df),
+    "(", round(custom_assigned/nrow(comp_df)*100,1), "%)\n")
+cat("ImmGen: assigned", immgen_assigned, "/", nrow(comp_df), "(100%)\n")
+    false_macs, "(", false_mac_pct, "%)\n")
+
+#Comparison bar chart
+assignment_df <- data.frame(
+  Classifier = c("Custom\nClassifier","Custom\nClassifier",
+                  "ImmGen\nReference","ImmGen\nReference"),
+  Category   = c("Confidently assigned","Unassigned / low confidence",
+                  "True macrophages","Misclassified"),
+  Cells      = c(custom_assigned, custom_unassigned,
+                  true_macs, false_macs),
+  Fill       = c("#27AE60","grey70","#27AE60","#C0392B")
+)
+
+p_assignment <- ggplot(
+  assignment_df[assignment_df$Classifier == "Custom\nClassifier", ],
+  aes(x = Category, y = Cells, fill = Fill)) +
+  geom_bar(stat = "identity", width = 0.6,
+           color = "black", linewidth = 0.4) +
+  scale_fill_identity() +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, nrow(comp_df) * 1.1)) +
+  bar_pub_theme() +
+  ylab("Cell count") + xlab("")
+
+p_immgen_accuracy <- ggplot(
+  assignment_df[assignment_df$Classifier == "ImmGen\nReference", ],
+  aes(x = Category, y = Cells, fill = Fill)) +
+  geom_bar(stat = "identity", width = 0.6,
+           color = "black", linewidth = 0.4) +
+  scale_fill_identity() +
+  scale_y_continuous(expand = c(0, 0)) +
+  bar_pub_theme() +
+  ylab("Cell count") + xlab("")
+
+p_assignment_comparison <- p_assignment | p_immgen_accuracy
+p_assignment_comparison
+
+
+
+save_pub(p_assignment_comparison, "Fig3_Assignment_Comparison",
+         comparison_dir, width = 220, height = 100)
+
+```
+
+
+
+```{r ImmGen misclassification breakdown}
+
+non_mac_types <- c("Ly6C-hi Mono","Ly6C-lo Mono","B Cells","NKT",
+                    "Neutrophils","DCs","ECs","Arterial ECs","Venous ECs",
+                    "Fibroblasts","RCFs","VSMCs","Cardiomyocytes",
+                    "Transitional fibroblasts","Matrifibrocytes")
+
+misclass_df <- comp_df %>%
+  filter(custom_label %in% non_mac_types) %>%
+  group_by(custom_label) %>%
+  summarise(
+    total         = n(),
+    called_mac    = sum(immgen_broad == "Macrophages"),
+    pct_called_mac = round(called_mac / total * 100, 1),
+    .groups = "drop"
+  ) %>%
+  filter(total >= 5) %>%
+  arrange(desc(pct_called_mac))
+
+misclass_df$custom_label <- factor(misclass_df$custom_label,
+                                    levels = misclass_df$custom_label)
+
+p_misclass <- ggplot(misclass_df,
+                      aes(x = custom_label,
+                          y = pct_called_mac,
+                          fill = pct_called_mac)) +
+  geom_bar(stat = "identity", width = 0.7,
+           color = "black", linewidth = 0.4) +
+  geom_text(aes(label = paste0(called_mac, " cells\n(",
+                                pct_called_mac, "%)")),
+            hjust = -0.05, size = 2.8, color = "black") +
+  coord_flip(ylim = c(0, max(misclass_df$pct_called_mac) * 1.4)) +
+  scale_fill_gradient(low = "#F9EBEA", high = "#C0392B",
+                       guide = "none") +
+  scale_y_continuous(expand = c(0, 0),
+                      labels = function(x) paste0(x, "%")) +
+  bar_pub_theme() +
+  theme(axis.text.y = element_text(size = 9, face = "bold")) +
+  xlab("") +
+  ylab("% called 'Macrophages' by ImmGen")
+
+p_misclass
+
+
+save_pub(p_misclass, "Fig4_ImmGen_Misclassification_Rate",
+         comparison_dir, width = 180, height = 140)
+
+
+```
+
+
+```{r Highlight UMAPs: ImmGen macrophage calls}
+
+make_highlight_umap <- function(df, cell_type, correct_color) {
+  
+  df$status <- "Other"
+  df$status[df$custom_label == cell_type &
+              df$immgen_broad != "Macrophages"] <- paste0(cell_type, " (correct)")
+  df$status[df$custom_label == cell_type &
+              df$immgen_broad == "Macrophages"] <- paste0(cell_type, " → 'Macrophages'")
+
+  # Build color vector with dynamic names using setNames
+  colors <- setNames(
+    c("grey88", correct_color, "#C0392B"),
+    c("Other",
+      paste0(cell_type, " (correct)"),
+      paste0(cell_type, " → 'Macrophages'"))
+  )
+
+  df_ordered <- df[order(df$status == "Other", decreasing = TRUE), ]
+
+  ggplot(df_ordered,
+         aes(x = UMAP_1, y = UMAP_2, color = status)) +
+    geom_point(size = 0.5, alpha = 1.0, stroke = 0) +
+    scale_color_manual(values = colors,
+                       guide = guide_legend(
+                         override.aes = list(size = 3, alpha = 1))) +
+    umap_pub_theme() +
+    theme(legend.position = "bottom",
+          legend.text     = element_text(size = 7),
+          legend.key.size = unit(0.3, "cm")) +
+    add_umap_arrows(df) +
+    annotate("text",
+             x = min(df$UMAP_1), y = max(df$UMAP_2),
+             label = cell_type, hjust = 0, vjust = 1,
+             size = 3.5, fontface = "bold")
+}
+
+#Build panels
+p_dc <- make_highlight_umap(comp_df, "DCs", "#E67E22")
+p_lo_mono <- make_highlight_umap(comp_df, "Ly6C-lo Mono", "#F39C12")
+p_bcells  <- make_highlight_umap(comp_df, "B Cells",      "#2980B9")
+p_nkt     <- make_highlight_umap(comp_df, "NKT",          "#CC79A7")
+p_vsmc    <- make_highlight_umap(comp_df, "VSMCs",        "#E91E8C")
+p_cardio  <- make_highlight_umap(comp_df, "Cardiomyocytes","#7A9134")
+
+p_highlight_panel <- (p_dc | p_lo_mono | p_bcells) /
+                     (p_nkt     | p_vsmc    | p_cardio)
+
+p_highlight_panel
+
+save_pub(p_highlight_panel, "Fig5_ImmGen_Misclassification_UMAPs",
+         comparison_dir, width = 260, height = 200)
+
+```
+
+
+
+```{r Precision-Prevalence analysis }
+
+
+# Calculate metrics per custom cell type
+all_types <- unique(comp_df$custom_label)
+all_types <- all_types[all_types != "Unassigned"]
+total_cells <- nrow(comp_df)
+immgen_mac_total <- sum(comp_df$immgen_broad == "Macrophages")
+
+prev_prec_df <- lapply(all_types, function(ct) {
+  ct_cells  <- comp_df$custom_label == ct
+  n_true    <- sum(ct_cells)
+  tp        <- sum(ct_cells & comp_df$immgen_broad == "Macrophages")
+
+  data.frame(
+    CellType   = ct,
+    N          = n_true,
+    Prevalence = n_true / total_cells * 100,
+    # Sensitivity: of true cells, % ImmGen got right
+    Sensitivity = if (n_true > 0)
+      sum(ct_cells & comp_df$immgen_broad ==
+            normalize_immgen(unique(comp_df$immgen_label[ct_cells])[1])) /
+      n_true * 100 else NA,
+    # Pct miscalled as Macrophages
+    Pct_Mac    = tp / n_true * 100,
+    stringsAsFactors = FALSE
+  )
+}) %>% bind_rows() %>%
+  filter(N >= 10) %>%
+  arrange(desc(Prevalence))
+
+# Broad lineage for color
+lineage_colors_simple <- c(
+  "Macrophages"        = "#C0392B",
+  "Monocytes"          = "#E67E22",
+  "Neutrophils"        = "#0072B2",
+  "DCs"                = "#56B4E9",
+  "Lymphoid"           = "#2980B9",
+  "Endothelial"        = "#27AE60",
+  "Fibroblast/Stromal" = "#8E44AD",
+  "VSMCs"              = "#E91E8C",
+  "Cardiomyocytes"     = "#7A9134",
+  "Other"              = "grey70"
+)
+
+# Scatter: prevalence vs % miscalled as macrophages
+cor_test <- cor.test(prev_prec_df$Prevalence,
+                      prev_prec_df$Pct_Mac,
+                      method = "spearman")
+
+p_prev_prec <- ggplot(prev_prec_df,
+                       aes(x = Prevalence, y = Pct_Mac,
+                           color = Lineage, size = N)) +
+  geom_smooth(method = "lm", se = TRUE,
+              color     = "black",
+              fill      = "grey92",
+              linewidth = 0.6,
+              alpha     = 0.4,
+              inherit.aes = FALSE,
+              aes(x = Prevalence, y = Pct_Mac)) +
+  geom_point(alpha = 0.95, stroke = 0.3) +
+  geom_text_repel(aes(label = CellType),
+                  size               = 2.5,
+                  fontface           = "italic",
+                  color              = "black",
+                  max.overlaps       = 30,
+                  seed               = 42,
+                  box.padding        = 0.5,
+                  point.padding      = 0.3,
+                  segment.size       = 0.25,
+                  segment.color      = "grey60",
+                  min.segment.length = 0.2,
+                  force              = 3) +
+  scale_color_manual(values = lineage_colors_simple,
+                     name   = "Lineage",
+                     guide  = guide_legend(
+                       override.aes = list(size = 4, alpha = 1))) +
+  scale_size_continuous(range = c(2, 9),
+                         name  = "Cell count",
+                         guide = guide_legend(
+                           override.aes = list(color = "grey40"))) +
+  annotate("text",
+           x     = max(prev_prec_df$Prevalence) * 0.55,
+           y     = min(prev_prec_df$Pct_Mac, na.rm = TRUE) + 5,
+           label = sprintf("Spearman r = %.2f\np = %.3f",
+                            cor_test$estimate, cor_test$p.value),
+           size      = 3.2, fontface = "bold",
+           hjust     = 0, vjust = 0,
+           color     = "black") +
+
+  scale_x_continuous(expand = c(0.02, 0)) +
+  scale_y_continuous(expand = c(0.02, 0),
+                      limits = c(-5,
+                                  max(prev_prec_df$Pct_Mac,
+                                      na.rm = TRUE) * 1.12),
+                      labels = function(x) paste0(x, "%")) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text         = element_text(size = 9, color = "black",
+                                      face = "bold"),
+    axis.title        = element_text(size = 10, color = "black",
+                                      face = "bold"),
+    axis.line         = element_line(color = "black", linewidth = 0.6),
+    axis.ticks        = element_line(color = "black", linewidth = 0.4),
+    axis.ticks.length = unit(0.2, "cm"),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank(),
+    plot.background   = element_blank(),
+    legend.position   = "right",
+    legend.text       = element_text(size = 8),
+    legend.title      = element_text(size = 9, face = "bold"),
+    legend.key.size   = unit(0.4, "cm"),
+    legend.background = element_blank(),
+    plot.margin       = margin(10, 10, 8, 10)
+  ) +
+  xlab("Cell type prevalence") +
+  ylab("% labeled 'Macrophages' by ImmGen")
+
+p_prev_prec
+
+save_pub(p_prev_prec, "Fig6_Prevalence_Precision_Scatter",
+         comparison_dir, width = 180, height = 140)
+
+```
+
+
+```{r Sensitivity Precision F1 table}
+
+#Defining cell types and expected ImmGen broad labels
+validation_types <- data.frame(
+  CellType       = c("CCR2+ Mac","ARG1+ Mac","MHCII Mac","TLF Mac",
+                      "Prolif TLF Mac","Ly6C-hi Mono","Ly6C-lo Mono",
+                      "B Cells","NKT","Neutrophils","DCs"),
+  Expected_broad = c("Macrophages","Macrophages","Macrophages","Macrophages",
+                      "Macrophages","Monocytes","Monocytes",
+                      "Lymphoid","Lymphoid","Neutrophils","DCs"),
+  stringsAsFactors = FALSE
+)
+
+#Calculating metrics per cell type
+metrics_df <- lapply(seq_len(nrow(validation_types)), function(i) {
+  ct       <- validation_types$CellType[i]
+  expected <- validation_types$Expected_broad[i]
+
+  ct_cells     <- comp_df$custom_label == ct
+  n_true       <- sum(ct_cells)
+  immgen_calls <- comp_df$immgen_broad == expected
+  tp           <- sum(ct_cells & immgen_calls)
+
+  sensitivity <- if (n_true > 0) tp / n_true else 0
+  precision   <- if (sum(immgen_calls) > 0) tp / sum(immgen_calls) else 0
+  f1          <- if (sensitivity + precision > 0)
+                   2 * sensitivity * precision / (sensitivity + precision) else 0
+
+  data.frame(
+    CellType    = ct,
+    Sensitivity = round(sensitivity * 100, 1),
+    Precision   = round(precision   * 100, 1),
+    F1          = round(f1          * 100, 1),
+    N           = n_true,
+    stringsAsFactors = FALSE
+  )
+}) %>% bind_rows()
+
+#Weighted F1 
+total_assigned        <- sum(metrics_df$N)
+metrics_df$Weight     <- metrics_df$N / total_assigned
+metrics_df$F1_weighted <- metrics_df$F1 * metrics_df$Weight
+
+weighted_f1_overall <- sum(metrics_df$F1_weighted)
+
+#Save metrics
+cat("\n=== Validation Metrics ===\n")
+print(metrics_df[, c("CellType","N","Sensitivity","Precision",
+                      "F1","Weight","F1_weighted")])
+cat("\nUnweighted mean F1:", round(mean(metrics_df$F1), 1), "%\n")
+cat("Weighted mean F1:  ", round(weighted_f1_overall, 1), "%\n")
+
+write.csv(metrics_df,
+          file.path(comparison_dir, "validation_metrics.csv"),
+          row.names = FALSE)
+
+#Order by weighted F1 
+metrics_df <- metrics_df %>% arrange(desc(F1_weighted))
+
+# Pivot for plotting
+metrics_long <- metrics_df %>%
+  tidyr::pivot_longer(cols      = c("Sensitivity","Precision","F1"),
+                       names_to  = "Metric",
+                       values_to = "Value") %>%
+  mutate(
+    CellType = factor(CellType, levels = metrics_df$CellType),
+    Metric   = factor(Metric,
+                      levels = c("Sensitivity","Precision","F1"))
+  )
+
+#Plot
+p_metrics <- ggplot(metrics_long,
+                     aes(x = CellType, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge",
+           width = 0.7, color = "black", linewidth = 0.3) +
+  scale_fill_manual(
+    values = c("Sensitivity" = "#2980B9",
+               "Precision"   = "#27AE60",
+               "F1"          = "#C0392B"),
+    guide  = guide_legend(override.aes = list(color = NA))
+  ) +
+  scale_y_continuous(
+    expand = c(0, 0),
+    limits = c(0, 118),
+    labels = function(x) paste0(x, "%")
+  ) +
+  geom_text(data = metrics_df,
+            aes(x = CellType, y = 110,
+                label = paste0("n=", N)),
+            inherit.aes = FALSE,
+            size = 2.2, color = "grey30",
+            fontface = "italic") +
+  # Weighted F1 annotation
+  annotate("text",
+           x     = length(unique(metrics_long$CellType)) * 0.55,
+           y     = 116,
+           label = paste0("Weighted F1 = ",
+                           round(weighted_f1_overall, 1), "%"),
+           size = 3, fontface = "bold",
+           hjust = 0, color = "black") +
+  bar_pub_theme() +
+  xlab("") +
+  ylab("ImmGen annotation accuracy (%)")
+
+p_metrics
+
+save_pub(p_metrics, "Fig7_Sensitivity_Precision_F1_weighted",
+         comparison_dir, width = 240, height = 120)
+
+
+```
+
+
+
+```{r Proportion comparison: Custom vs ImmGen}
+
+# Custom proportions
+prop_custom <- comp_df %>%
+  filter(custom_label != "Unassigned") %>%
+  count(sample, custom_broad) %>%
+  group_by(sample) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  rename(CellType = custom_broad) %>%
+  mutate(Classifier = "Custom")
+
+# ImmGen proportions
+prop_immgen <- comp_df %>%
+  count(sample, immgen_broad) %>%
+  group_by(sample) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  ungroup() %>%
+  rename(CellType = immgen_broad) %>%
+  mutate(Classifier = "ImmGen")
+
+prop_combined <- bind_rows(prop_custom, prop_immgen) %>%
+  filter(!CellType %in% c("Unassigned","Other")) %>%
+  mutate(Classifier = factor(Classifier,
+                              levels = c("Custom","ImmGen")))
+
+p_prop_compare <- ggplot(prop_combined,
+                          aes(x = reorder(CellType, -pct),
+                              y = pct,
+                              fill = Classifier)) +
+  geom_bar(stat = "identity", position = "dodge",
+           width = 0.7, color = "black", linewidth = 0.3) +
+  facet_wrap(~sample, ncol = 2) +
+  scale_fill_manual(values = c("Custom" = "#2C7FB8",
+                                "ImmGen" = "#D55E00")) +
+  scale_y_continuous(expand = c(0, 0)) +
+  bar_pub_theme() +
+  theme(strip.text       = element_text(face = "bold", size = 10),
+        strip.background = element_blank()) +
+  xlab("") + ylab("% of total cells")
+
+p_prop_compare
+
+
+
+save_pub(p_prop_compare, "Fig8_Proportion_Custom_vs_ImmGen",
+         comparison_dir, width = 260, height = 120)
+
+
+
+```
+
+
+```{r Save summary tables}
+
+# Master summary
+summary_stats <- data.frame(
+  Metric = c(
+    "Total cells analyzed",
+    "Custom: cells assigned (>=0.5)",
+    "Custom: cells unassigned (<0.5)",
+    "Custom: assignment rate",
+    "ImmGen: cells assigned (always 100%)",
+    "ImmGen: 'Macrophage' calls total",
+    "ImmGen: true macrophage calls",
+    "ImmGen: false macrophage calls",
+    "ImmGen: false macrophage rate"
+  ),
+  Value = c(
+    nrow(comp_df),
+    custom_assigned,
+    custom_unassigned,
+    paste0(round(custom_assigned/nrow(comp_df)*100,1), "%"),
+    nrow(comp_df),
+    nrow(immgen_mac_calls),
+    true_macs,
+    false_macs,
+    paste0(false_mac_pct, "%")
+  )
+)
+
+write.csv(summary_stats,
+          file.path(comparison_dir, "comparison_summary.csv"),
+          row.names = FALSE)
+
+# Save full comparison dataframe
+write.csv(comp_df,
+          file.path(comparison_dir, "full_comparison_per_cell.csv"),
+          row.names = FALSE)
+
+
+```
+
