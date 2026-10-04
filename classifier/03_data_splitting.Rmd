@@ -1,0 +1,223 @@
+---
+title: "Immune Classifier, Step 3: Stratified Train/Test/Validation Split"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2026-03-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(yaml)
+})
+
+# Configuration 
+cat("Phase 3: Three-Way Data Splitting\n")
+
+# Load config
+config_path <- "/projects/b1246/Isaac/immune_classifier/config/config.yaml"
+config <- yaml::read_yaml(config_path)
+
+cat("Configuration loaded\n")
+
+# Load Atlas with PCA
+cat("\n[1/6] Loading atlas with PCA...\n")
+
+atlas_path <- file.path(config$paths$data_dir, "processed", "atlas_with_pca.rds")
+if (!file.exists(atlas_path)) {
+  stop("Atlas with PCA not found. Run Phase 2 first: ", atlas_path)
+}
+
+seurat_atlas <- readRDS(atlas_path)
+
+cat(sprintf("Loaded atlas with %s cells and %s cell types\n",
+            format(ncol(seurat_atlas), big.mark = ","),
+            length(unique(seurat_atlas$cell_type))))
+
+# Check Cell Type Counts
+cat("\n[2/6] Checking cell type distribution...\n")
+
+cell_type_counts <- table(seurat_atlas$cell_type)
+cell_type_df <- data.frame(
+  Cell_Type = names(cell_type_counts),
+  Count = as.numeric(cell_type_counts)
+) %>% arrange(desc(Count))
+
+cat("\n Cell type counts:\n")
+print(cell_type_df, row.names = FALSE)
+
+# Check for cell types that are too rare to split
+min_cells_required <- 15  # Minimum cells for a three-way split
+rare_types <- cell_type_df %>% filter(Count < min_cells_required)
+
+if (nrow(rare_types) > 0) {
+  print(rare_types, row.names = FALSE)
+  cat("\n  These will be split, but validation/test sets may have very few cells.\n\n")
+}
+
+# Stratified Three-Way Split
+cat("\n[3/6] Performing stratified three-way split...\n")
+
+# Get split parameters
+set.seed(config$splitting$random_seed)
+train_pct <- config$splitting$train_pct
+test_pct <- config$splitting$test_pct
+val_pct <- config$splitting$validation_pct
+
+cat(sprintf("  Random seed: %d\n", config$splitting$random_seed))
+cat(sprintf("  Split ratios: Train=%.0f%%, Test=%.0f%%, Validation=%.0f%%\n",
+            train_pct * 100, test_pct * 100, val_pct * 100))
+
+# Initialize split column
+seurat_atlas$split <- NA
+
+# Split each cell type separately (stratified)
+cell_types <- unique(seurat_atlas$cell_type)
+
+for (ct in cell_types) {
+  # Get cells of this type
+  ct_cells <- colnames(seurat_atlas)[seurat_atlas$cell_type == ct]
+  n_cells <- length(ct_cells)
+  
+  # Calculate split sizes
+  n_train <- round(n_cells * train_pct)
+  n_test <- round(n_cells * test_pct)
+  n_val <- n_cells - n_train - n_test  # remaining cells
+  
+  # Shuffle cells
+  shuffled_cells <- sample(ct_cells)
+  
+  # Assign to splits
+  train_cells <- shuffled_cells[1:n_train]
+  test_cells <- shuffled_cells[(n_train + 1):(n_train + n_test)]
+  val_cells <- shuffled_cells[(n_train + n_test + 1):n_cells]
+  
+  # Update metadata
+  seurat_atlas$split[colnames(seurat_atlas) %in% train_cells] <- "train"
+  seurat_atlas$split[colnames(seurat_atlas) %in% test_cells] <- "test"
+  seurat_atlas$split[colnames(seurat_atlas) %in% val_cells] <- "validation"
+}
+
+cat("Split assignments complete\n")
+
+# Verify Split Proportions
+cat("\n[4/6] Verifying split proportions...\n")
+
+# Overall proportions
+split_summary <- table(seurat_atlas$split)
+split_pct <- prop.table(split_summary) * 100
+
+cat("\n Overall split distribution:\n")
+for (split_name in names(split_summary)) {
+  cat(sprintf("  %s: %d cells (%.1f%%)\n",
+              split_name,
+              split_summary[split_name],
+              split_pct[split_name]))
+}
+
+# Per cell type verification
+split_by_type <- table(seurat_atlas$cell_type, seurat_atlas$split)
+split_by_type_df <- as.data.frame.matrix(split_by_type)
+split_by_type_df$Cell_Type <- rownames(split_by_type_df)
+split_by_type_df <- split_by_type_df %>%
+  select(Cell_Type, train, test, validation) %>%
+  arrange(desc(train))
+
+cat("  Split distribution by cell type:\n")
+print(split_by_type_df, row.names = FALSE)
+
+# Check for cell types with too few cells in any split
+min_cells_per_split <- 3
+problematic_types <- split_by_type_df %>%
+  filter(train < min_cells_per_split | 
+         test < min_cells_per_split | 
+         validation < min_cells_per_split)
+
+if (nrow(problematic_types) > 0) {
+  print(problematic_types, row.names = FALSE)
+  cat("\n  Consider merging these cell types or excluding them from training.\n\n")
+}
+
+# Visualize Splits
+cat("\n[5/6] Generating split visualizations...\n")
+
+results_dir <- file.path(config$paths$results_dir, "figures", "phase3_splits")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Bar plot of split proportions by cell type
+split_long <- split_by_type_df %>%
+  tidyr::pivot_longer(cols = c(train, test, validation),
+                      names_to = "Split",
+                      values_to = "Count")
+
+p_splits <- ggplot(split_long, aes(x = Cell_Type, y = Count, fill = Split)) +
+  geom_bar(stat = "identity", position = "stack") +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "train" = "#2E7D32",
+    "test" = "#1976D2",
+    "validation" = "#F57C00"
+  )) +
+  labs(
+    title = "Data Split Distribution by Cell Type",
+    x = "Cell Type",
+    y = "Number of Cells",
+    fill = "Split"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text.y = element_text(size = 10),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = file.path(results_dir, "split_distribution_by_celltype.png"),
+  plot = p_splits,
+  width = 10, height = 8, dpi = 300
+)
+
+cat(sprintf("Saved visualizations to: %s\n", results_dir))
+
+# Save Split Assignments
+cat("\n[6/6] Saving split assignments...\n")
+
+# Save atlas with split assignments
+output_path <- file.path(config$paths$data_dir, "processed", "atlas_with_splits.rds")
+saveRDS(seurat_atlas, output_path)
+
+cat(sprintf("Saved atlas with splits to: %s\n", output_path))
+cat(sprintf("  File size: %.2f MB\n", file.size(output_path) / 1024^2))
+
+# Save split summary for reference
+metrics_dir <- file.path(config$paths$results_dir, "metrics")
+dir.create(metrics_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(
+  split_by_type_df,
+  file = file.path(metrics_dir, "phase3_split_summary.csv"),
+  row.names = FALSE
+)
+
+cat(sprintf("Saved split summary to: %s\n",
+            file.path(metrics_dir, "phase3_split_summary.csv")))
+
+# Summary
+cat("Phase 3 Complete: Three-Way Data Splitting\n")
+
+cat("Summary:\n")
+cat(sprintf("Total cells: %s\n", format(ncol(seurat_atlas), big.mark = ",")))
+cat(sprintf("Training cells: %d (%.1f%%)\n",
+            split_summary["train"], split_pct["train"]))
+cat(sprintf("Testing cells: %d (%.1f%%)\n",
+            split_summary["test"], split_pct["test"]))
+cat(sprintf("Validation cells: %d (%.1f%%)\n",
+            split_summary["validation"], split_pct["validation"]))
+cat(sprintf("Cell types: %d\n", length(unique(seurat_atlas$cell_type))))
+cat(sprintf("Random seed: %d\n", config$splitting$random_seed))
+
+
+```
