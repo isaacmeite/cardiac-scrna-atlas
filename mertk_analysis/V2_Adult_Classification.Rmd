@@ -1,0 +1,1504 @@
+---
+title: "MERTK Adult-Only Integration, Annotation and Downstream Analysis"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2026-03-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Packages}
+
+library(Seurat)
+library(harmony)
+library(SingleCellExperiment)
+library(batchelor)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(patchwork)
+library(gridExtra)
+library(sctransform)
+library(SingleR)
+
+```
+
+
+```{r Loading Data & Subsetting}
+
+seurat_phase <- readRDS("/projects/b1246/Isaac/seurat_phase.rds")
+
+print(table(seurat_phase$orig.ident))
+print(table(seurat_phase$age_group))
+
+# Subset to adults only
+seurat_adults <- subset(seurat_phase, subset = age_group == "Adult")
+
+print(table(seurat_adults$orig.ident))
+
+```
+
+
+
+```{r QC Plots, include=FALSE}
+
+metadata_adults <- seurat_adults@meta.data
+levels <- c("WT", "KO")
+
+# nCells
+p1 <- metadata_adults %>%
+  ggplot(aes(x = factor(sample, levels = levels), fill = sample)) +
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  xlab("Condition") + ggtitle("nCells") + NoLegend()
+
+# nUMIs
+p2 <- metadata_adults %>%
+  ggplot(aes(color = sample, x = nUMI, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("nUMIs")
+
+# nGenes
+p3 <- metadata_adults %>%
+  ggplot(aes(x = factor(sample, levels = levels), y = log10(nGene), fill = sample)) +
+  geom_boxplot() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  xlab("Condition") + ggtitle("nGenes") + NoLegend()
+
+# Mito Ratio
+p4 <- metadata_adults %>%
+  ggplot(aes(color = sample, x = mitoRatio, fill = sample)) +
+  geom_density(alpha = 0.1) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 0.3) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Mito Ratio") + NoLegend()
+
+# Ribo Ratio
+p5 <- metadata_adults %>%
+  ggplot(aes(color = sample, x = riboRatio, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 0.5) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Ribo Ratio") + NoLegend()
+
+# Novelty Score
+p6 <- metadata_adults %>%
+  ggplot(aes(x = log10GenesPerUMI, color = sample, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Unique genes per UMI") + NoLegend()
+
+plot1 <- grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2)
+plot1
+
+# nGene vs nUMI
+plot2 <- metadata_adults %>%
+  ggplot(aes(x = nUMI, y = nGene, color = mitoRatio)) +
+  geom_point() +
+  scale_colour_gradient(low = "deepskyblue3", high = "firebrick4") +
+  stat_smooth(method = lm) +
+  scale_x_log10() + scale_y_log10() +
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+
+plot2
+
+# Save
+ggsave(filename = "QCmetrics_adults.tiff", plot = plot1,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+ggsave(filename = "nGene_v_nUMI_adults.tiff", plot = plot2,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures",
+       device = "tiff", dpi = 500, width = 7, height = 5, units = "in", compression = "lzw")
+
+
+```
+
+
+
+```{r SCTransform, include=FALSE}
+
+
+seurat_adults[["RNA"]] <- JoinLayers(seurat_adults[["RNA"]])
+seurat_adults[["RNA"]] <- split(seurat_adults[["RNA"]], f = seurat_adults$age_group)
+
+seurat_adults <- SCTransform(seurat_adults, method = "glmGamPoi", verbose = FALSE)
+seurat_adults <- RunPCA(seurat_adults, npcs = 50, verbose = FALSE)
+seurat_adults <- RunUMAP(seurat_adults, dims = 1:30, verbose = FALSE)
+
+# Baseline — no integration
+sample_no_integration    <- DimPlot(seurat_adults, reduction = "umap", group.by = "sample")
+age_group_no_integration <- DimPlot(seurat_adults, reduction = "umap", group.by = "age_group")
+
+sample_no_integration
+age_group_no_integration
+
+# Save
+ggsave(filename = "Sample.tiff", plot = sample_no_integration,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_NO_Integration",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+ggsave(filename = "Age_Group.tiff", plot = age_group_no_integration,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_NO_Integration",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+```
+
+
+
+```{r CCA Integration}
+
+seurat_cca <- IntegrateLayers(
+  object               = seurat_adults,
+  method               = CCAIntegration,
+  normalization.method = "SCT",
+  verbose              = FALSE
+)
+
+seurat_cca <- FindNeighbors(seurat_cca, reduction = "integrated.dr", dims = 1:30)
+seurat_cca <- FindClusters(seurat_cca, resolution = 0.6)
+seurat_cca <- RunUMAP(seurat_cca, dims = 1:30, reduction = "integrated.dr")
+
+sample_cca    <- DimPlot(seurat_cca, reduction = "umap", group.by = "sample")
+age_group_cca <- DimPlot(seurat_cca, reduction = "umap", group.by = "age_group")
+
+sample_cca
+age_group_cca
+
+# Save
+ggsave(filename = "Sample.tiff", plot = sample_cca,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_Integration_(Seurat_CCA)",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+ggsave(filename = "Age_Group.tiff", plot = age_group_cca,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_Integration_(Seurat_CCA)",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+saveRDS(seurat_cca, "/projects/b1246/Isaac/MERTK/v2_adults_only/data/02_integration/seurat_adults_cca.rds")
+
+
+
+```
+
+
+```{r Harmony Integration}
+
+DefaultAssay(seurat_adults) <- "SCT"
+
+seurat_adults$seq_folder <- as.factor(seurat_adults$seq_folder)
+
+seurat_harmony <- RunHarmony(seurat_adults, group.by.vars = "seq_folder")
+seurat_harmony <- RunUMAP(seurat_harmony, reduction = "harmony", dims = 1:30)
+
+sample_harmony    <- DimPlot(seurat_harmony, reduction = "umap", group.by = "sample")
+age_group_harmony <- DimPlot(seurat_harmony, reduction = "umap", group.by = "age_group")
+
+sample_harmony
+age_group_harmony
+
+
+
+# Save
+ggsave(filename = "Sample.tiff", plot = sample_harmony,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_Harmony",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+ggsave(filename = "Age_Group.tiff", plot = age_group_harmony,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_Harmony",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+saveRDS(seurat_harmony, "/projects/b1246/Isaac/MERTK/v2_adults_only/data/02_integration/seurat_adults_harmony.rds")
+
+```
+
+```{r MNN Integration}
+split_seurat <- SplitObject(seurat_adults, split.by = "seq_folder")
+
+split_seurat <- lapply(split_seurat, function(obj) {
+  DefaultAssay(obj) <- "SCT"
+  return(obj)
+})
+
+integration.features <- Reduce(intersect, lapply(split_seurat, VariableFeatures))
+
+sce_list <- lapply(split_seurat, as.SingleCellExperiment)
+sce_list <- lapply(sce_list, function(sce) sce[rownames(sce) %in% integration.features, ])
+
+mnn_out <- fastMNN(sce_list, d = 30)
+assay(mnn_out, "reconstructed") <- as.matrix(assay(mnn_out, "reconstructed"))
+
+seurat_mnn <- as.Seurat(mnn_out, counts = "reconstructed", data = "reconstructed")
+
+seurat_mnn[["mnn"]] <- CreateDimReducObject(
+  embeddings = reducedDim(mnn_out, "corrected"),
+  key        = "MNN_",
+  assay      = DefaultAssay(seurat_mnn)
+)
+
+seurat_mnn <- RunUMAP(seurat_mnn, reduction = "mnn", dims = 1:30)
+
+# Recover metadata
+seurat_mnn@meta.data <- seurat_adults@meta.data[colnames(seurat_mnn), ]
+
+sample_mnn    <- DimPlot(seurat_mnn, reduction = "umap", group.by = "sample")
+age_group_mnn <- DimPlot(seurat_mnn, reduction = "umap", group.by = "age_group")
+
+sample_mnn
+age_group_mnn
+
+
+# Save
+ggsave(filename = "Sample.tiff", plot = sample_mnn,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_MNN",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+ggsave(filename = "Age_Group.tiff", plot = age_group_mnn,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/UMAP_MNN",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+saveRDS(seurat_mnn, "/projects/b1246/Isaac/MERTK/v2_adults_only/data/02_integration/seurat_adults_mnn.rds")
+
+```
+
+```{r Clustering resolution (Harmony)}
+
+#Load Harmony-integrated object
+seurat_integrated <- readRDS("/projects/b1246/Isaac/MERTK/v2_adults_only/data/02_integration/seurat_adults_harmony.rds")
+chosen_reduction  <- "harmony"
+
+#Clustering 
+seurat_integrated <- FindNeighbors(seurat_integrated,
+                                    reduction = chosen_reduction,
+                                    dims = 1:30, verbose = FALSE)
+
+# Test multiple resolutions
+resolutions <- c(0.1, 0.2, 0.3, 0.4, 0.5)
+for (res in resolutions) {
+  seurat_integrated <- FindClusters(seurat_integrated, resolution = res, verbose = FALSE)
+}
+
+
+# Clustree
+library(clustree)
+ct <- clustree(seurat_integrated, prefix = "SCT_snn_res.")
+ct
+
+# Set chosen resolution
+Idents(seurat_integrated) <- "SCT_snn_res.0.3"
+seurat_integrated$seurat_clusters <- seurat_integrated$SCT_snn_res.0.3
+
+p_res03 <- DimPlot(seurat_integrated, reduction = "umap", label = TRUE, repel = TRUE) +
+  NoLegend() + ggtitle("Clusters at res 0.3")
+p_res03
+
+# Save
+ggsave(filename = "Clusters_res03.tiff", plot = p_res03,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/Clustering",
+       device = "tiff", dpi = 500, width = 7, height = 7, units = "in", compression = "lzw")
+
+ggsave(filename = "Clustree.tiff", plot = ct,
+       path = "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/Clustering",
+       device = "tiff", dpi = 500, width = 14, height = 10, units = "in", compression = "lzw")
+
+```
+
+
+
+```{r Clustering with Immune Classifier}
+
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+library(dplyr)
+library(celldex)
+library(SingleR)
+library(scales)
+
+out_dir <- "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/Publication"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+#Build plot_df 
+plot_df <- data.frame(
+  UMAP_1      = Embeddings(seurat_integrated, "umap")[, 1],
+  UMAP_2      = Embeddings(seurat_integrated, "umap")[, 2],
+  final_label = seurat_integrated$classifier_label,
+  sample      = seurat_integrated$sample,
+  row.names   = colnames(seurat_integrated)
+)
+
+plot_df$broad_label <- dplyr::case_when(
+  plot_df$final_label %in% c("TLF Mac", "CCR2+ Mac", "MHCII Mac",
+                              "ARG1+ Mac", "Prolif TLF Mac")         ~ "Macrophages",
+  plot_df$final_label %in% c("Ly6C-hi Mono", "Ly6C-lo Mono")        ~ "Monocytes",
+  plot_df$final_label %in% c("Neutrophils")                          ~ "Neutrophils",
+  plot_df$final_label %in% c("DCs")                                  ~ "Dendritic Cells",
+  plot_df$final_label %in% c("B Cells")                              ~ "B Cells",
+  plot_df$final_label %in% c("NKT")                                  ~ "NKT",
+  plot_df$final_label %in% c("Cardiomyocytes")                       ~ "Cardiomyocytes",
+  plot_df$final_label %in% c("VSMCs")                                ~ "VSMCs",
+  plot_df$final_label %in% c("ECs", "Arterial ECs", "Venous ECs")   ~ "Endothelial",
+  plot_df$final_label %in% c("Transitional fibroblasts", "Fibroblast",
+                              "Fibroblast progenitors", "Ccl2 fibroblasts",
+                              "Matrifibrocytes", "RCFs", "Prolif RCFs",
+                              "Unassigned stromal")                   ~ "Fibroblasts/Stromal",
+  TRUE                                                                ~ "Other"
+)
+
+seurat_integrated$broad_label <- plot_df$broad_label
+
+
+#Color palettes
+broad_colors <- c(
+  "Macrophages"         = "#D62728",
+  "Monocytes"           = "#FF7F0E",
+  "Neutrophils"         = "#BCBD22",
+  "Dendritic Cells"     = "#9467BD",
+  "B Cells"             = "#1F77B4",
+  "NKT"                 = "#00BCD4",
+  "Cardiomyocytes"      = "#E91E63",
+  "VSMCs"               = "#795548",
+  "Endothelial"         = "#2CA02C",
+  "Fibroblasts/Stromal" = "#90A4AE",
+  "Other"               = "#F5F5F5"
+)
+
+sample_colors <- c(
+  "KO" = "#D62728",
+  "WT" = "#1F77B4"
+)
+
+#Shared UMAP theme 
+umap_theme <- function(legend_pos = "right") {
+  theme_classic(base_size = 11) +
+    theme(
+      plot.title       = element_blank(),
+      plot.subtitle    = element_blank(),
+      axis.line        = element_blank(),
+      axis.ticks       = element_blank(),
+      axis.text        = element_blank(),
+      axis.title       = element_blank(),
+      panel.border     = element_blank(),
+      panel.background = element_blank(),
+      plot.background  = element_blank(),
+      legend.position  = legend_pos,
+      legend.key       = element_blank(),
+      legend.key.size  = unit(0.4, "cm"),
+      legend.text      = element_text(size = 9, face = "bold",
+                                       color = "black"),
+      legend.title     = element_blank(),
+      plot.margin      = margin(5, 5, 5, 5)
+    )
+}
+
+# Shared axis arrow helper
+add_umap_arrows <- function(p, df, arrow_len = 3.0, label_size = 3.0) {
+  x0 <- min(df$UMAP_1) + 0.2
+  y0 <- min(df$UMAP_2) + 0.2
+  p +
+    annotate("segment",
+             x = x0, xend = x0 + arrow_len,
+             y = y0, yend = y0,
+             arrow     = arrow(length = unit(0.18, "cm"), type = "closed"),
+             color     = "black", linewidth = 0.7) +
+    annotate("segment",
+             x = x0, xend = x0,
+             y = y0, yend = y0 + arrow_len,
+             arrow     = arrow(length = unit(0.18, "cm"), type = "closed"),
+             color     = "black", linewidth = 0.7) +
+    annotate("text",
+             x      = x0 + arrow_len / 2,
+             y      = y0 - 0.6,
+             label  = "UMAP-1",
+             size   = label_size, color = "black",
+             hjust  = 0.5, fontface = "bold") +
+    annotate("text",
+             x      = x0 - 0.6,
+             y      = y0 + arrow_len / 2,
+             label  = "UMAP-2",
+             size   = label_size, color = "black",
+             hjust  = 0.5, angle = 90, fontface = "bold")
+}
+
+#save_figure helper 
+save_figure <- function(filename, plot, path, width, height,
+                         units = "mm") {
+  ggsave(
+    filename    = paste0(filename, ".pdf"),
+    plot        = plot,
+    path        = path,
+    device      = cairo_pdf,
+    width       = width,
+    height      = height,
+    units       = units
+  )
+  ggsave(
+    filename    = paste0(filename, ".tiff"),
+    plot        = plot,
+    path        = path,
+    device      = "tiff",
+    width       = width,
+    height      = height,
+    units       = units,
+    dpi         = 600,
+    compression = "lzw",
+    bg          = "white"
+  )
+}
+
+
+#Broad category UMAP
+plot_df_ordered <- plot_df[order(
+  plot_df$broad_label %in% c("Other", "Fibroblasts/Stromal"),
+  decreasing = TRUE
+), ]
+
+p_broad <- ggplot(plot_df_ordered,
+                   aes(x = UMAP_1, y = UMAP_2, color = broad_label)) +
+  geom_point(size = 0.8, alpha = 0.95, stroke = 0) +
+  scale_color_manual(
+    values = broad_colors,
+    name   = NULL,
+    guide  = guide_legend(
+      override.aes = list(size = 5, alpha = 1, shape = 16),
+      ncol         = 1
+    )
+  ) +
+  umap_theme("right")
+
+p_broad <- add_umap_arrows(p_broad, plot_df)
+p_broad
+
+save_figure("Fig4A_broad_UMAP", p_broad, out_dir, 160, 130)
+
+#UMAP KO vs WT
+
+make_split_panel <- function(df_panel, panel_title) {
+  df_panel <- df_panel[order(
+    df_panel$broad_label %in% c("Other", "Fibroblasts/Stromal"),
+    decreasing = TRUE
+  ), ]
+  p <- ggplot(df_panel,
+               aes(x = UMAP_1, y = UMAP_2, color = broad_label)) +
+    geom_point(size = 0.8, alpha = 0.95, stroke = 0) +
+    scale_color_manual(values = broad_colors, name = NULL) +
+    umap_theme("none")
+  add_umap_arrows(p, plot_df)
+}
+
+plot_ko       <- plot_df[plot_df$sample == "KO", ]
+plot_wt       <- plot_df[plot_df$sample == "WT", ]
+p_ko          <- make_split_panel(plot_ko, "KO")
+p_wt          <- make_split_panel(plot_wt, "WT")
+p_broad_split <- p_ko | p_wt
+p_broad_split
+
+save_figure("Fig4B_split_UMAP_KO_WT", p_broad_split, out_dir, 260, 130)
+
+
+#Population highlight panel
+
+highlight_pop <- function(cells_highlight, panel_title, highlight_color) {
+  df           <- plot_df
+  df$highlight <- ifelse(rownames(df) %in% cells_highlight,
+                         "highlight", "other")
+  df <- df[order(df$highlight == "highlight"), ]
+
+  p <- ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = highlight)) +
+    geom_point(size = 0.8, alpha = 0.95, stroke = 0) +
+    scale_color_manual(
+      values = c("highlight" = highlight_color, "other" = "#F5F5F5"),
+      guide  = "none"
+    ) +
+    annotate("text",
+             x     = min(plot_df$UMAP_1),
+             y     = max(plot_df$UMAP_2),
+             label = panel_title,
+             hjust = 0, vjust = 1,
+             size  = 3.5, fontface = "bold", color = "black") +
+    umap_theme("none")
+  add_umap_arrows(p, plot_df, arrow_len = 2.5, label_size = 2.5)
+}
+
+cells_mac   <- colnames(seurat_integrated)[
+  seurat_integrated$classifier_label %in%
+    c("ARG1+ Mac","CCR2+ Mac","MHCII Mac","TLF Mac","Prolif TLF Mac")]
+cells_mono  <- colnames(seurat_integrated)[
+  seurat_integrated$classifier_label %in%
+    c("Ly6C-hi Mono","Ly6C-lo Mono")]
+cells_ec    <- colnames(seurat_integrated)[
+  seurat_integrated$classifier_label %in%
+    c("ECs","Venous ECs","Arterial ECs")]
+cells_fib   <- colnames(seurat_integrated)[
+  seurat_integrated$classifier_label %in%
+    c("Fibroblasts","Fibroblast progenitors","Ccl2 fibroblasts",
+      "Transitional fibroblasts","Matrifibrocytes","RCFs","Prolif RCFs")]
+cells_lymph <- colnames(seurat_integrated)[
+  seurat_integrated$classifier_label %in% c("B Cells","NKT")]
+cells_other <- colnames(seurat_integrated)[
+  seurat_integrated$classifier_label %in%
+    c("Neutrophils","DCs","VSMCs","Cardiomyocytes")]
+
+p_hi_mac   <- highlight_pop(cells_mac,   "Macrophages",         "#D62728")
+p_hi_mono  <- highlight_pop(cells_mono,  "Monocytes",           "#FF7F0E")
+p_hi_ec    <- highlight_pop(cells_ec,    "Endothelial",         "#2CA02C")
+p_hi_fib   <- highlight_pop(cells_fib,   "Fibroblasts/Stromal", "#9467BD")
+p_hi_lymph <- highlight_pop(cells_lymph, "Lymphoid",            "#1F77B4")
+p_hi_other <- highlight_pop(cells_other, "Other myeloid",       "#17BECF")
+
+p_highlights <- (p_hi_mac | p_hi_mono | p_hi_ec) /
+                (p_hi_fib | p_hi_lymph | p_hi_other)
+p_highlights
+
+save_figure("Fig4C_population_highlights", p_highlights, out_dir, 260, 200)
+
+# Cell type proportion bar charts
+
+# Broad proportions
+prop_broad <- as.data.frame(
+  prop.table(table(seurat_integrated$sample,
+                   seurat_integrated$broad_label), margin = 1) * 100
+)
+colnames(prop_broad) <- c("Sample", "CellType", "Percentage")
+prop_broad <- prop_broad[prop_broad$CellType != "Unassigned", ]
+
+ct_order_broad <- prop_broad %>%
+  group_by(CellType) %>%
+  summarise(mean_pct = mean(Percentage), .groups = "drop") %>%
+  arrange(desc(mean_pct)) %>%
+  pull(CellType)
+prop_broad$CellType <- factor(prop_broad$CellType, levels = ct_order_broad)
+
+p_prop_broad <- ggplot(prop_broad,
+                        aes(x = CellType, y = Percentage, fill = Sample)) +
+  geom_bar(stat     = "identity",
+           position = position_dodge(width = 0.75),
+           width    = 0.7) +
+  scale_fill_manual(values = sample_colors, name = NULL) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, max(prop_broad$Percentage) * 1.15)) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x        = element_text(angle = 45, vjust = 1, hjust = 1,
+                                       size = 9, color = "black",
+                                       face = "bold"),
+    axis.text.y        = element_text(size = 9, color = "black",
+                                       face = "bold"),
+    axis.title.y       = element_text(size = 10, color = "black",
+                                       face = "bold"),
+    axis.title.x       = element_blank(),
+    axis.line          = element_line(color = "black", linewidth = 0.5),
+    axis.ticks         = element_line(color = "black", linewidth = 0.4),
+    panel.border       = element_blank(),
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.3),
+    panel.grid.major.x = element_blank(),
+    legend.position    = "top",
+    legend.text        = element_text(size = 10, face = "bold"),
+    legend.key.size    = unit(0.45, "cm"),
+    plot.margin        = margin(10, 10, 5, 10)
+  ) +
+  ylab("% of total cells")
+
+p_prop_broad
+
+save_figure("Fig4D_proportion_broad", p_prop_broad, out_dir, 160, 100)
+
+#Subtype proportions
+prop_subtype <- as.data.frame(
+  prop.table(table(seurat_integrated$sample,
+                   seurat_integrated$classifier_label), margin = 1) * 100
+)
+colnames(prop_subtype) <- c("Sample", "CellType", "Percentage")
+prop_subtype <- prop_subtype[prop_subtype$CellType != "Unassigned", ]
+
+ct_order_sub <- prop_subtype %>%
+  group_by(CellType) %>%
+  summarise(mean_pct = mean(Percentage), .groups = "drop") %>%
+  arrange(desc(mean_pct)) %>%
+  pull(CellType)
+prop_subtype$CellType <- factor(prop_subtype$CellType, levels = ct_order_sub)
+
+p_prop_subtype <- ggplot(prop_subtype,
+                          aes(x = CellType, y = Percentage, fill = Sample)) +
+  geom_bar(stat     = "identity",
+           position = position_dodge(width = 0.75),
+           width    = 0.7) +
+  scale_fill_manual(values = sample_colors, name = NULL) +
+  scale_y_continuous(expand = c(0, 0),
+                     limits = c(0, max(prop_subtype$Percentage) * 1.15)) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x        = element_text(angle = 45, vjust = 1, hjust = 1,
+                                       size = 8, color = "black",
+                                       face = "bold"),
+    axis.text.y        = element_text(size = 9, color = "black",
+                                       face = "bold"),
+    axis.title.y       = element_text(size = 10, color = "black",
+                                       face = "bold"),
+    axis.title.x       = element_blank(),
+    axis.line          = element_line(color = "black", linewidth = 0.5),
+    axis.ticks         = element_line(color = "black", linewidth = 0.4),
+    panel.border       = element_blank(),
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.3),
+    panel.grid.major.x = element_blank(),
+    legend.position    = "top",
+    legend.text        = element_text(size = 10, face = "bold"),
+    legend.key.size    = unit(0.45, "cm"),
+    plot.margin        = margin(10, 10, 5, 10)
+  ) +
+  ylab("% of total cells")
+
+p_prop_subtype
+
+save_figure("FigS7_proportion_subtype", p_prop_subtype, out_dir, 220, 110)
+
+
+
+
+# Run ImmGen/SingleR only if not already present
+if (!"immgen_label" %in% colnames(seurat_integrated@meta.data)) {
+  message("Running ImmGen/SingleR annotation...")
+
+  DefaultAssay(seurat_integrated) <- "RNA"
+
+# Join RNA layers
+  seurat_integrated <- JoinLayers(seurat_integrated, assay = "RNA")
+
+  immgen_ref <- celldex::ImmGenData()
+
+  sce_adult <- as.SingleCellExperiment(
+    seurat_integrated,
+    assay = "RNA"
+  )
+
+  immgen_pred <- SingleR(
+    test = sce_adult,
+    ref = immgen_ref,
+    labels = immgen_ref$label.main
+  )
+
+  seurat_integrated$immgen_label <- immgen_pred$labels
+}
+
+# Check ImmGen labels
+print(sort(table(seurat_integrated$immgen_label), decreasing = TRUE))
+
+# Define ImmGen macrophage calls
+immgen_mac_labels <- unique(seurat_integrated$immgen_label[
+  grepl("Macrophage|macrophage|Mac", seurat_integrated$immgen_label)
+])
+
+print(immgen_mac_labels)
+
+# Add ImmGen macrophage flag to plotting df
+plot_df$immgen_label <- seurat_integrated$immgen_label[rownames(plot_df)]
+plot_df$immgen_called_mac <- plot_df$immgen_label %in% immgen_mac_labels
+
+# Panel A: fraction of each cardiac classifier label called macrophage by ImmGen
+s8_bar_df <- plot_df %>%
+  filter(!final_label %in% c("Unassigned", "Unassigned stromal")) %>%
+  group_by(final_label) %>%
+  summarise(
+    n_cells = n(),
+    n_immgen_mac = sum(immgen_called_mac),
+    pct_immgen_mac = 100 * n_immgen_mac / n_cells,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_immgen_mac))
+
+s8_bar_df$final_label <- factor(s8_bar_df$final_label, levels = s8_bar_df$final_label)
+
+p_s8a <- ggplot(s8_bar_df, aes(x = final_label, y = pct_immgen_mac)) +
+  geom_col(fill = "#B2182B", width = 0.75) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    expand = c(0, 0),
+    labels = function(x) paste0(x, "%")
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45, hjust = 1, vjust = 1,
+      size = 8, color = "black", face = "bold"
+    ),
+    axis.text.y = element_text(size = 9, color = "black", face = "bold"),
+    axis.title.y = element_text(size = 10, color = "black", face = "bold"),
+    axis.title.x = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.4),
+    panel.grid.major.y = element_line(color = "grey92", linewidth = 0.3),
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(10, 10, 5, 10)
+  ) +
+  ylab("% called macrophage by ImmGen")
+
+p_s8a
+
+save_figure("FigS8A_ImmGen_macrophage_misclassification_bar", p_s8a, out_dir, 180, 100)
+
+# Panel B: highlight UMAPs for populations frequently called macrophage by ImmGen
+highlight_immgen_mac <- function(cell_type, highlight_color = "#B2182B") {
+  df <- plot_df
+  
+  df$highlight <- ifelse(
+    df$final_label == cell_type & df$immgen_called_mac,
+    "ImmGen macrophage call",
+    "Other"
+  )
+  
+  df <- df[order(df$highlight == "ImmGen macrophage call"), ]
+  n_highlight <- sum(df$highlight == "ImmGen macrophage call")
+  
+  p <- ggplot(df, aes(x = UMAP_1, y = UMAP_2, color = highlight)) +
+    geom_point(size = 0.75, alpha = 0.95, stroke = 0) +
+    scale_color_manual(
+      values = c(
+        "ImmGen macrophage call" = highlight_color,
+        "Other" = "#E6E6E6"
+      ),
+      guide = "none"
+    ) +
+    annotate(
+      "text",
+      x = min(plot_df$UMAP_1),
+      y = max(plot_df$UMAP_2),
+      label = paste0(cell_type, "\n", n_highlight, " cells"),
+      hjust = 0,
+      vjust = 1,
+      size = 3.2,
+      fontface = "bold",
+      color = "black"
+    ) +
+    umap_theme("none")
+  
+  add_umap_arrows(p, plot_df, arrow_len = 2.5, label_size = 2.5)
+}
+
+p_s8_dcs   <- highlight_immgen_mac("DCs")
+p_s8_ly6lo <- highlight_immgen_mac("Ly6C-lo Mono")
+p_s8_b     <- highlight_immgen_mac("B Cells")
+p_s8_nkt   <- highlight_immgen_mac("NKT")
+p_s8_vsmc  <- highlight_immgen_mac("VSMCs")
+p_s8_cm    <- highlight_immgen_mac("Cardiomyocytes")
+
+p_s8b <- (p_s8_dcs | p_s8_ly6lo | p_s8_b) /
+         (p_s8_nkt | p_s8_vsmc  | p_s8_cm)
+
+p_s8b
+
+save_figure("FigS8B_ImmGen_macrophage_highlight_UMAPs", p_s8b, out_dir, 260, 180)
+
+
+# Classifier confidence histogram (FigS6A)
+hist_df <- data.frame(
+  prob = seurat_integrated$classifier_prob,
+  assigned = ifelse(
+    seurat_integrated$classifier_label == "Unassigned",
+    "Unassigned", "Assigned"
+  )
+)
+
+y_max <- max(ggplot_build(
+  ggplot(hist_df, aes(x = prob)) +
+    geom_histogram(binwidth = 0.05)
+)$data[[1]]$count)
+
+p_hist <- ggplot(hist_df, aes(x = prob, fill = assigned)) +
+  geom_histogram(
+    binwidth = 0.05,
+    color = "white",
+    linewidth = 0.15,
+    alpha = 0.95
+  ) +
+  geom_vline(
+    xintercept = 0.5,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.7
+  ) +
+  scale_fill_manual(
+    values = c("Assigned" = "#2CA02C", "Unassigned" = "#D9D9D9"),
+    name = NULL
+  ) +
+  scale_x_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, y_max * 1.08)) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text = element_text(size = 10, color = "black", face = "bold"),
+    axis.title = element_text(size = 11, color = "black", face = "bold"),
+    axis.line = element_line(color = "black", linewidth = 0.6),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    axis.ticks.length = unit(0.2, "cm"),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "top",
+    legend.text = element_text(size = 10, face = "bold"),
+    legend.key.size = unit(0.4, "cm"),
+    plot.margin = margin(10, 10, 5, 10)
+  ) +
+  xlab("Classifier confidence") +
+  ylab("Cell count")
+
+p_hist
+
+save_figure("FigS6A_confidence_histogram", p_hist, out_dir, 120, 90)
+
+#Classifier confidence UMAP
+
+conf_df      <- plot_df
+conf_df$prob <- seurat_integrated$classifier_prob
+conf_df <- conf_df[order(conf_df$prob, decreasing = FALSE), ]
+
+p_conf_umap <- ggplot(conf_df,
+                       aes(x = UMAP_1, y = UMAP_2, color = prob)) +
+  geom_point(size = 0.8, stroke = 0, alpha = 0.95) +
+  scale_color_gradientn(
+    colours = c("grey90", "#74C476", "#238B45", "#00441B"),
+    name    = "Confidence",
+    limits  = c(0, 1),
+    guide   = guide_colorbar(
+      barwidth    = 0.5,
+      barheight   = 4,
+      ticks       = TRUE,
+      title.theme = element_text(size = 9, face = "bold", angle = 0),
+      label.theme = element_text(size = 8, face = "bold")
+    )
+  ) +
+  umap_theme("right")
+
+p_conf_umap <- add_umap_arrows(p_conf_umap, plot_df)
+p_conf_umap
+
+save_figure("FigS6B_confidence_UMAP", p_conf_umap, out_dir, 150, 130)
+
+#Session Info
+sink(file.path(out_dir, "session_info_publication_figures.txt"))
+print(sessionInfo())
+sink()
+
+               
+```
+
+### Figure 4A: KO and WT UMAPs with shared legend
+```{r Add Annotation legend to figure 4A}
+
+# KO and WT UMAPs with one shared cell-type legend
+
+make_split_panel_legend <- function(df_panel) {
+
+  df_panel <- df_panel[order(
+    df_panel$broad_label %in% c("Other", "Fibroblasts/Stromal"),
+    decreasing = TRUE
+  ), ]
+
+  p <- ggplot(
+    df_panel,
+    aes(x = UMAP_1, y = UMAP_2, color = broad_label)
+  ) +
+    geom_point(
+      size = 0.8,
+      alpha = 0.95,
+      stroke = 0
+    ) +
+    scale_color_manual(
+      values = broad_colors,
+      name = NULL,
+      drop = FALSE,
+      guide = guide_legend(
+        override.aes = list(
+          size = 5,
+          alpha = 1,
+          shape = 16
+        ),
+        ncol = 1
+      )
+    ) +
+    umap_theme("right")
+
+  add_umap_arrows(p, plot_df)
+}
+
+p_ko_legend <- make_split_panel_legend(plot_ko)
+p_wt_legend <- make_split_panel_legend(plot_wt)
+
+p_split_legend <- (
+  p_ko_legend | p_wt_legend
+) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "right")
+
+p_split_legend
+
+out_dir <- "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/Publication/"
+
+save_figure(
+  "Fig4A_broad_UMAP_KO_WT_shared_legend",
+  p_split_legend,
+  out_dir,
+  280,
+  130
+)
+
+
+
+
+```
+
+
+
+
+
+
+
+
+```{r Save Final objects}
+
+# Seurat objects 
+saveRDS(seurat_integrated,
+        "/projects/b1246/Isaac/MERTK/v2_adults_only/data/03_clustering/seurat_adults_annotated.rds")
+
+# Supplementary tables
+write.csv(prop_broad,
+          file.path(out_dir, "TableS1_proportions_broad_KOvsWT.csv"),
+          row.names = FALSE)
+
+write.csv(prop_subtype,
+          file.path(out_dir, "TableS2_proportions_subtype_KOvsWT.csv"),
+          row.names = FALSE)
+
+# Summary stats
+summary_table <- data.frame(
+  Metric = c("Total cells", "KO cells", "WT cells",
+             "Cells assigned (≥0.5)", "Cells unassigned (<0.5)",
+             "Mean classifier probability", "Median classifier probability",
+             "Integration method", "Clustering resolution",
+             "Number of broad cell type categories",
+             "Number of cell subtypes"),
+  Value = c(
+    ncol(seurat_integrated),
+    sum(seurat_integrated$sample == "KO"),
+    sum(seurat_integrated$sample == "WT"),
+    sum(seurat_integrated$classifier_prob >= 0.5),
+    sum(seurat_integrated$classifier_prob <  0.5),
+    round(mean(seurat_integrated$classifier_prob),   3),
+    round(median(seurat_integrated$classifier_prob), 3),
+    "Harmony",
+    "0.3",
+    length(unique(seurat_integrated$broad_label[
+      seurat_integrated$broad_label != "Unassigned"])),
+    length(unique(seurat_integrated$classifier_label[
+      seurat_integrated$classifier_label != "Unassigned"]))
+  )
+)
+write.csv(summary_table,
+          file.path(out_dir, "TableS3_classifier_summary.csv"),
+          row.names = FALSE)
+
+# Cell-level metadata table
+# Contains every cell's barcode, sample, cluster, broad label, subtype label,
+# confidence score
+metadata_export <- data.frame(
+  cell_id            = colnames(seurat_integrated),
+  sample             = seurat_integrated$sample,
+  orig_ident         = seurat_integrated$orig.ident,
+  seurat_cluster     = seurat_integrated$seurat_clusters,
+  broad_label        = seurat_integrated$broad_label,
+  classifier_label   = seurat_integrated$classifier_label,
+  classifier_prob    = seurat_integrated$classifier_prob,
+  classifier_conf    = seurat_integrated$classifier_confidence,
+  raw_label          = seurat_integrated$raw_label,
+  final_label        = seurat_integrated$final_label,
+  UMAP_1             = Embeddings(seurat_integrated, "umap")[, 1],
+  UMAP_2             = Embeddings(seurat_integrated, "umap")[, 2]
+)
+
+write.csv(metadata_export,
+          file.path(out_dir, "TableS4_cell_metadata.csv"),
+          row.names = FALSE)
+
+#Session info 
+sink(file.path(out_dir, "session_info.txt"))
+print(sessionInfo())
+sink()
+
+
+```
+
+
+
+
+```{r CellChat object creation}
+
+seurat_integrated <- readRDS(
+  "/projects/b1246/Isaac/MERTK/v2_adults_only/data/03_clustering/seurat_adults_annotated.rds"
+)
+
+# Join layers and keep RNA only
+DefaultAssay(seurat_integrated) <- "RNA"
+seurat_integrated <- JoinLayers(seurat_integrated)
+
+#Remove Unassigned and cell types with < 10 cells
+valid_types <- names(table(seurat_integrated$classifier_label)[
+  table(seurat_integrated$classifier_label) >= 10
+])
+valid_types <- valid_types[valid_types != "Unassigned"]
+
+print(sort(table(seurat_integrated$classifier_label[
+  seurat_integrated$classifier_label %in% valid_types
+]), decreasing = TRUE))
+
+all_types <- unique(seurat_integrated$classifier_label)
+print(all_types[!all_types %in% valid_types])
+
+# Subset to valid cells only
+cells_keep <- colnames(seurat_integrated)[
+  seurat_integrated$classifier_label %in% valid_types
+]
+
+seurat_slim <- DietSeurat(
+  seurat_integrated[, cells_keep],
+  assays    = "RNA",
+  dimreducs = "umap"
+)
+
+# Set classifier_label as active ident
+Idents(seurat_slim) <- "classifier_label"
+
+
+saveRDS(seurat_slim,
+        "/projects/b1246/Isaac/MERTK/v2_adults_only/data/seurat_adults_for_cellchat.rds")
+
+```
+
+
+
+
+
+```{r Cell Intrinsic DE: KO vs WT}
+
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+#Directories
+de_dir  <- "/projects/b1246/Isaac/MERTK/v2_adults_only/data/DE_KO_vs_WT"
+fig_dir <- "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/DE_KO_vs_WT"
+dir.create(de_dir,  recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+#Load object 
+seurat_integrated <- readRDS(
+  "/projects/b1246/Isaac/MERTK/v2_adults_only/data/03_clustering/seurat_adults_annotated.rds"
+)
+
+#Cell types to test 
+cell_types_to_test <- c(
+  "ARG1+ Mac",
+  "MHCII Mac",
+  "CCR2+ Mac",
+  "TLF Mac",
+  "B Cells"
+)
+
+#Volcano plot function
+make_de_volcano <- function(de_df, cell_type_label,
+                             fc_thresh = 0.5, pval_thresh = 0.05,
+                             n_label = 15) {
+  df <- de_df
+  df$sig <- "NS"
+  df$sig[df$avg_log2FC >  fc_thresh & df$p_val_adj < pval_thresh] <- "KO_up"
+  df$sig[df$avg_log2FC < -fc_thresh & df$p_val_adj < pval_thresh] <- "WT_up"
+  df$sig <- factor(df$sig, levels = c("KO_up", "WT_up", "NS"))
+
+  top_ko   <- head(df[df$sig == "KO_up", ], n_label)
+  top_wt   <- head(df[df$sig == "WT_up", ], n_label)
+  to_label <- rbind(top_ko, top_wt)
+
+  ggplot(df, aes(x = avg_log2FC,
+                  y = -log10(p_val_adj + 1e-300),
+                  color = sig,
+                  size  = sig)) +
+    geom_point(alpha = 0.8, stroke = 0) +
+    geom_text_repel(
+      data               = to_label,
+      aes(label          = gene),
+      size               = 3.0,
+      fontface           = "italic",
+      color              = "black",
+      max.overlaps       = 40,
+      seed               = 42,
+      segment.size       = 0.3,
+      segment.color      = "grey40",
+      segment.alpha      = 0.6,
+      box.padding        = 0.5,
+      point.padding      = 0.2,
+      force              = 2,
+      min.segment.length = 0.2
+    ) +
+    scale_color_manual(
+      values = c("KO_up" = "#C0392B",
+                 "WT_up" = "#2471A3",
+                 "NS"    = "grey82"),
+      name   = NULL
+    ) +
+    scale_size_manual(
+      values = c("KO_up" = 1.6, "WT_up" = 1.6, "NS" = 0.8),
+      guide  = "none"
+    ) +
+    geom_vline(xintercept = c(-fc_thresh, fc_thresh),
+               linetype = "dashed", color = "grey50",
+               linewidth = 0.35, alpha = 0.8) +
+    geom_hline(yintercept = -log10(pval_thresh),
+               linetype = "dashed", color = "grey50",
+               linewidth = 0.35, alpha = 0.8) +
+    scale_x_continuous(expand = c(0.02, 0)) +
+    scale_y_continuous(expand = c(0.01, 0)) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title        = element_text(face = "bold", size = 12,
+                                        hjust = 0.5, color = "black",
+                                        margin = margin(b = 8)),
+      axis.text         = element_text(size = 10, color = "black"),
+      axis.title        = element_text(size = 11, color = "black",
+                                        face = "bold"),
+      axis.line         = element_line(color = "black", linewidth = 0.5),
+      axis.ticks        = element_line(color = "black", linewidth = 0.4),
+      axis.ticks.length = unit(0.2, "cm"),
+      panel.grid        = element_blank(),
+      panel.border      = element_blank(),
+      legend.position   = "none",
+      plot.margin       = margin(12, 15, 10, 12)
+    ) +
+    labs(
+      title = cell_type_label,
+      x     = "Average log\u2082 fold change",
+      y     = "-log\u2081\u2080 (adjusted p-value)"
+    )
+}
+
+
+#DE loop
+de_results <- list()
+
+seurat_integrated <- PrepSCTFindMarkers(seurat_integrated)
+seurat_integrated <- JoinLayers(seurat_integrated)
+
+for (ct in cell_types_to_test) {
+
+  cells_ct <- colnames(seurat_integrated)[
+    seurat_integrated$classifier_label == ct
+  ]
+  cells_ko <- cells_ct[seurat_integrated$sample[cells_ct] == "KO"]
+  cells_wt <- cells_ct[seurat_integrated$sample[cells_ct] == "WT"]
+
+  if (length(cells_ko) < 3 || length(cells_wt) < 3) next
+
+  de <- tryCatch({
+    FindMarkers(
+      seurat_integrated,
+      ident.1         = cells_ko,
+      ident.2         = cells_wt,
+      test.use        = "wilcox",
+      min.pct         = 0.1,
+      logfc.threshold = 0.1,
+      verbose         = FALSE
+    )
+  }, error = function(e) {
+    cat("Error in", ct, ":", conditionMessage(e), "\n")
+    return(NULL)
+  })
+
+  if (is.null(de) || nrow(de) == 0) next
+
+  de$gene <- rownames(de)
+  de <- de[order(de$avg_log2FC, decreasing = TRUE), ]
+
+  de_results[[ct]] <- de
+
+  ct_clean <- gsub("[+ /]", "_", ct)
+  write.csv(de,
+            file.path(de_dir, paste0("DE_KOvsWT_", ct_clean, ".csv")),
+            row.names = TRUE)
+
+  p_vol <- make_de_volcano(de, ct)
+
+  ggsave(
+    filename    = paste0("Volcano_KOvsWT_", ct_clean, ".tiff"),
+    plot        = p_vol,
+    path        = fig_dir,
+    device      = "tiff",
+    width       = 150,
+    height      = 130,
+    units       = "mm",
+    dpi         = 600,
+    compression = "lzw",
+    bg          = "white"
+  )
+}
+```
+
+
+```{r Module scoring: pathway activity KO vs WT per macrophage subtype}
+
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(ggrepel)
+
+module_dir <- "/projects/b1246/Isaac/MERTK/v2_adults_only/figures/Module_Scores"
+dir.create(module_dir, recursive = TRUE, showWarnings = FALSE)
+
+seurat_integrated <- readRDS(
+  "/projects/b1246/Isaac/MERTK/v2_adults_only/data/03_clustering/seurat_adults_annotated.rds"
+)
+
+DefaultAssay(seurat_integrated) <- "SCT"
+
+# Gene sets (mouse symbols)
+
+modules <- list(
+
+  IL10_STAT3 = c(
+    "Il10", "Il10ra", "Il10rb", "Stat3",
+    "Socs3", "Bcl3", "Il4ra", "Arg1",
+    "Mrc1", "Cd163", "Lgals1", "Il1rn"
+  ),
+
+  Alternative_Activation = c(
+    "Arg1", "Mrc1", "Cd163", "Retnla",
+    "Chil3", "Dab2", "Cd206", "Il4",
+    "Il13", "Socs1", "Irf4", "Pparg",
+    "Nr1h3", "Abca1", "Abcg1"
+  ),
+
+  TGFb_Response = c(
+    "Tgfb1", "Tgfb2", "Tgfb3",
+    "Tgfbr1", "Tgfbr2", "Smad2",
+    "Smad3", "Smad7", "Ltbp1",
+    "Thbs1", "Fn1", "Col1a1"
+  ),
+
+  MHCII_Antigen_Presentation = c(
+    "H2-Ab1", "H2-Aa", "H2-Eb1",
+    "H2-Eb2", "Cd74", "H2-Oa",
+    "H2-Ob", "Ciita", "Tap1",
+    "Tap2", "B2m", "H2-D1"
+  ),
+
+  Efferocytosis = c(
+    "Mertk", "Axl", "Tyro3",
+    "Gas6", "Pros1", "Timd4",
+    "Stab1", "Stab2", "Cd36",
+    "Mfge8", "Anxa1", "Calr",
+    "Gulp1", "Elmo1", "Dock1"
+  ),
+
+  Complement_Activation = c(
+    "C1qa", "C1qb", "C1qc",
+    "C3", "Cfb", "Cfd",
+    "C5ar1", "Itgam", "Fcgr1",
+    "Fcgr3", "Fcgr4", "C4b"
+  ),
+
+  Inflammatory_M1 = c(
+    "Tnf", "Il1b", "Il6",
+    "Il12a", "Il12b", "Nos2",
+    "Cxcl9", "Cxcl10", "Cxcl11",
+    "Cd86", "Cd80", "Irf5",
+    "Nfkb1", "Ptgs2", "Saa3"
+  )
+)
+
+#Add module scores 
+for (nm in names(modules)) {
+  seurat_integrated <- AddModuleScore(
+    seurat_integrated,
+    features = list(modules[[nm]]),
+    name     = nm,
+    assay    = "SCT",
+    nbin = 15
+  )
+  # AddModuleScore appends "1" to the name
+  colnames(seurat_integrated@meta.data)[
+    colnames(seurat_integrated@meta.data) == paste0(nm, "1")
+  ] <- nm
+}
+
+#Subset to macrophage subtypes
+mac_types <- c("ARG1+ Mac", "MHCII Mac", "CCR2+ Mac", "TLF Mac")
+
+seurat_mac <- seurat_integrated[,
+  seurat_integrated$classifier_label %in% mac_types
+]
+
+#Violin plot function
+make_module_vln <- function(obj, module_name, cell_types,
+                             colors = c("KO" = "#C0392B",
+                                        "WT" = "#2471A3")) {
+  df <- data.frame(
+    Score    = obj@meta.data[[module_name]],
+    CellType = obj$classifier_label,
+    Sample   = obj$sample
+  ) %>% filter(CellType %in% cell_types)
+
+  df$CellType <- factor(df$CellType, levels = cell_types)
+
+  ggplot(df, aes(x = Sample, y = Score, fill = Sample)) +
+    geom_violin(scale = "width", trim = TRUE,
+                alpha = 0.85, linewidth = 0.3) +
+    geom_boxplot(width = 0.15, outlier.size = 0,
+                 fill = "white", color = "grey30",
+                 linewidth = 0.3) +
+    facet_wrap(~CellType, nrow = 1, scales = "free_y") +
+    scale_fill_manual(values = colors, guide = "none") +
+    theme_classic(base_size = 11) +
+    theme(
+      strip.text       = element_text(face = "bold", size = 9),
+      strip.background = element_blank(),
+      axis.text.x      = element_text(size = 9, face = "bold",
+                                       color = "black"),
+      axis.text.y      = element_text(size = 8, color = "black"),
+      axis.title.x     = element_blank(),
+      axis.title.y     = element_text(size = 9, face = "bold"),
+      axis.line        = element_line(linewidth = 0.5),
+      axis.ticks       = element_line(linewidth = 0.4),
+      panel.grid       = element_blank(),
+      plot.margin      = margin(8, 8, 5, 8)
+    ) +
+    ylab(paste0(gsub("_", " ", module_name), " score"))
+}
+
+#Statistical testing: Wilcoxon KO vs WT per cell type
+run_module_stats <- function(obj, module_name, cell_types) {
+  results <- lapply(cell_types, function(ct) {
+    df_ct <- data.frame(
+      Score  = obj@meta.data[[module_name]],
+      Sample = obj$sample,
+      CT     = obj$classifier_label
+    ) %>% filter(CT == ct)
+
+    ko_scores <- df_ct$Score[df_ct$Sample == "KO"]
+    wt_scores <- df_ct$Score[df_ct$Sample == "WT"]
+
+    if (length(ko_scores) < 3 || length(wt_scores) < 3) return(NULL)
+
+    test <- wilcox.test(ko_scores, wt_scores)
+
+    data.frame(
+      Module   = module_name,
+      CellType = ct,
+      N_KO     = length(ko_scores),
+      N_WT     = length(wt_scores),
+      Mean_KO  = round(mean(ko_scores), 4),
+      Mean_WT  = round(mean(wt_scores), 4),
+      Delta    = round(mean(ko_scores) - mean(wt_scores), 4),
+      P_value  = test$p.value,
+      stringsAsFactors = FALSE
+    )
+  })
+  bind_rows(results)
+}
+
+#Run stats for all modules
+all_stats <- lapply(names(modules), function(nm) {
+  run_module_stats(seurat_mac, nm, mac_types)
+}) %>% bind_rows()
+
+all_stats$P_adj <- p.adjust(all_stats$P_value, method = "BH")
+all_stats$Sig   <- ifelse(all_stats$P_adj < 0.001, "***",
+                    ifelse(all_stats$P_adj < 0.01, "**",
+                    ifelse(all_stats$P_adj < 0.05, "*", "NS")))
+
+write.csv(all_stats,
+          file.path(module_dir, "module_score_stats.csv"),
+          row.names = FALSE)
+
+print(all_stats[, c("Module","CellType","Mean_KO","Mean_WT",
+                     "Delta","P_adj","Sig")])
+
+#Generate and save plots
+for (nm in names(modules)) {
+  p <- make_module_vln(seurat_mac, nm, mac_types)
+
+  ggsave(
+    filename    = paste0("ModuleScore_", nm, ".tiff"),
+    plot        = p,
+    path        = module_dir,
+    device      = "tiff",
+    width       = 220,
+    height      = 100,
+    units       = "mm",
+    dpi         = 600,
+    compression = "lzw",
+    bg          = "white"
+  )
+}
+
+# Summary heatmap
+delta_mat <- all_stats %>%
+  select(Module, CellType, Delta) %>%
+  tidyr::pivot_wider(names_from = CellType, values_from = Delta) %>%
+  tibble::column_to_rownames("Module") %>%
+  as.matrix()
+
+sig_mat <- all_stats %>%
+  select(Module, CellType, Sig) %>%
+  tidyr::pivot_wider(names_from = CellType, values_from = Sig) %>%
+  tibble::column_to_rownames("Module") %>%
+  as.matrix()
+
+library(pheatmap)
+p_heatmap <- pheatmap(
+  delta_mat,
+  color            = colorRampPalette(c("#2471A3","white","#C0392B"))(100),
+  display_numbers  = sig_mat,
+  number_color     = "black",
+  fontsize          = 10,
+  fontsize_number   = 11,
+  cluster_rows      = FALSE,
+  cluster_cols      = FALSE,
+  angle_col         = 45,
+  border_color      = "grey90",
+  main              = "",
+  silent            = TRUE
+)
+
+ggsave(
+  filename    = "ModuleScore_summary_heatmap.tiff",
+  plot        = p_heatmap$gtable,
+  path        = module_dir,
+  device      = "tiff",
+  width       = 180,
+  height      = 140,
+  units       = "mm",
+  dpi         = 600,
+  compression = "lzw",
+  bg          = "white"
+)
+
+```
+
+
+
+
