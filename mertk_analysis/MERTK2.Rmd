@@ -1,0 +1,6058 @@
+title: "MERTK Adult-Only Dataset Processing and Analysis"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2024-11-12"
+output: html_document
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+#------------------
+#PACKAGES
+#-----------------
+```{r packages, include=FALSE}
+library(Seurat)
+library(BiocManager)
+library(scater)
+library(scran)
+library(dplyr)
+library(stringr)
+library(utils)
+library(ggplot2)
+library(cowplot)
+library(AnnotationHub)
+library(patchwork)
+library(Matrix)
+library(remotes)
+library(scuttle)
+library(bigstatsr)
+library(sctransform)
+library(SingleR)
+library(monocle3)
+```
+
+#------------------
+#LOADING DATA
+#-----------------
+
+1. Loading Output Data from the CellRanger Pipeline
+Reading the raw data for a single sample using a sparse matrix  with the Seurat function Read10X(). This function uses the CellRanger output directory to create the sparse matrix and save on RAM (memory) and CPU (processing capacity)
+
+2. After Calling Read10X(), Cellranger creates metadata for each of the cells: 
+
+orig.ident: this often contains the sample identity if known, but will default to "SeuratProject"
+nCount_RNA: number of UMIs per cell
+nFeature_RNA: number of genes detected per cell
+
+```{r Loading Data, include = FALSE }
+
+#-----------------------
+#ONBOARDING DATA
+#----------------------
+
+#MER_Ad_MI
+MER_Ad_MI <- Read10X( data.dir = "/projects/p31275/Isaac/MERTK/MER_Ad_MI")
+
+#MER_MI
+MER_MI <- Read10X(data.dir =  "/projects/p31275/Isaac/MERTK/MER_MI")
+
+#WT_Ad_MI
+WT_Ad_MI <- Read10X(data.dir =  "/projects/p31275/Isaac/MERTK/WT_Ad_MI")
+
+#WT_P1_MI_1
+WT_P1_MI_1 <- Read10X(data.dir =  "/projects/p31275/Isaac/MERTK/WT_P1_MI_1")
+
+#WT_P1_MI_2
+WT_P1_MI_2 <- Read10X(data.dir =  "/projects/p31275/Isaac/MERTK/WT_P1_MI_2")
+
+
+#------------------------
+#Convert to Seurat Object
+#------------------------
+
+
+MER_Ad_MI <- CreateSeuratObject( counts = MER_Ad_MI, project = "MER_Ad_MI")
+MER_MI <- CreateSeuratObject( counts = MER_MI, project = "MER_MI")
+WT_Ad_MI <- CreateSeuratObject( counts = WT_Ad_MI, project = "WT_Ad_MI")
+WT_P1_MI_1 <- CreateSeuratObject( counts = WT_P1_MI_1, project = "WT_P1_MI_1")
+WT_P1_MI_2 <- CreateSeuratObject( counts = WT_P1_MI_2, project = "WT_P1_MI_2")
+
+#----------------------------
+#Merging Biological Replicates
+-----------------------------
+merged_seurat_WT_P1 <- merge(x = WT_P1_MI_1, y = WT_P1_MI_2,
+                             add.cell.ids = c("WT_P1_MI_1", "WT_P1_MI_2"),
+                             project = "WT_P1_MI")
+
+#----------------------------
+#Merging All Datasets 
+-----------------------------
+#Labeling Cells 
+WT_P1_MI_1$orig.ident <- "WT_P1_MI_1"
+WT_P1_MI_2$orig.ident <- "WT_P1_MI_2"
+MER_Ad_MI$orig.ident <- "MER_Ad_MI"
+MER_MI$orig.ident <- "MER_MI"
+WT_Ad_MI$orig.ident <- "WT_Ad_MI"
+
+merged_seurat <- merge(
+  x = merged_seurat_WT_P1,
+  y = list(MER_Ad_MI, MER_MI, WT_Ad_MI))
+
+head(merged_seurat@meta.data)
+```
+
+
+#------------------
+#DATA QUALITY ASSESSMENT
+#-----------------
+
+
+1. Quality Control by accounting for the biology. Specifically, calculating the mitochondrial and ribosomal ratio. 
+This number should be low due to the cell types (cardiac tissue) and sequencing (nucleus)
+- number of genes detected per UMI: more genes per UMI detected represent larger complexity of the data 
+- Mitochondrial ratio: indicates the number of genes originating from the mitochondrial genes
+- Novelty Score: log10 of the number of UMIs per cell, then divide the log10 number of genes by the log10 number of UMIs.
+
+#Quality Control
+
+```{r Quality Control, include = FALSE}
+
+# Novelty score (log10 genes per UMI)
+merged_seurat$log10GenesPerUMI <- log10(merged_seurat$nFeature_RNA) / log10(merged_seurat$nCount_RNA)
+
+# Mitochondrial Feature Expression Ratio - searches through all gene identifiers in the dataset beginning with "mt"
+merged_seurat$mitoRatio <- PercentageFeatureSet(merged_seurat, pattern = "^mt-")
+merged_seurat$mitoRatio <- merged_seurat$mitoRatio / 100  # Ensure we get ratio and not percentage value 
+
+# Ribosomal Feature Expression Ratio
+merged_seurat$riboRatio <- PercentageFeatureSet(merged_seurat, pattern = "^Rp[ls]")
+merged_seurat$riboRatio <- merged_seurat$riboRatio / 100  # Ensure we get ratio and not percentage value 
+
+```
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata <- merged_seurat@meta.data
+metadata$cells <- rownames(metadata)
+
+# Assign metadata based on orig.ident patterns
+metadata <- metadata %>%
+  mutate(
+    genotype = case_when(
+      str_detect(orig.ident, "^MER_") ~ "KO",
+      str_detect(orig.ident, "^WT_") ~ "WT",
+      TRUE ~ "Other"
+    ),
+    sample = case_when(                     
+      genotype == "WT" ~ "WT",           
+      genotype == "KO" ~ "KO",
+      TRUE ~ NA_character_
+    ),
+    age_group = case_when(
+      orig.ident %in% c("MER_Ad_MI", "WT_Ad_MI") ~ "Adult",
+      orig.ident %in% c("MER_MI", "WT_P1_MI_1", "WT_P1_MI_2") ~ "Neonatal",
+      TRUE ~ NA_character_
+    ),
+    timepoint = "7dpi",
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+
+# Assign back to Seurat object
+merged_seurat@meta.data <- metadata
+head(merged_seurat@meta.data)
+```
+
+
+
+#################################################
+     ASSESSING DATA QUALITY: PLOTS
+#################################################
+
+Metrics to assess:
+Cell counts: number of cell counts per sample (nCells)
+UMI counts per cell
+Genes detected per cell
+Complexity (novelty score)
+Mitochondrial counts ratio
+
+#Notes
+Doublet detection was not performed
+
+#Displaying QC Metrics 
+```{r Assessing Data Quality, include = FALSE}
+# Define levels for the conditions
+levels <- c("WT", "KO")
+
+# Number of Cells
+p1 <- metadata %>% 
+  ggplot(aes(x = factor(x = merged_seurat@meta.data$sample, levels = levels), fill = sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  xlab("Condition") +
+  ggtitle("nCells") +
+  NoLegend()
+
+# Number of UMIs
+p2 <- metadata %>% 
+  ggplot(aes(color = sample, x = nUMI, fill = sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("nUMIs")
+
+# Number of Genes
+p3 <- metadata %>% 
+  ggplot(aes(x = factor(x = merged_seurat@meta.data$sample, levels = levels), y = log10(nGene), fill = sample)) +
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  xlab("Condition") +
+  ggtitle("nGenes") +
+  NoLegend()
+
+# Mitochondrial Counts Ratio
+p4 <- metadata %>% 
+  ggplot(aes(color = sample, x = mitoRatio, fill = sample)) + 
+  geom_density(alpha = 0.1) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.3) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Mito Ratio") +
+  NoLegend()
+
+# Ribosomal Counts Ratio
+p5 <- metadata %>% 
+  ggplot(aes(color = sample, x = riboRatio, fill = sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.5) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Ribo Ratio") +
+  NoLegend()
+
+# Novelty Gene (Unique genes per UMI)
+p6 <- metadata %>%
+  ggplot(aes(x = log10GenesPerUMI, color = sample, fill = sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Unique genes per UMI") +
+  NoLegend()
+
+# Combine all plots into a single grid
+library(gridExtra)
+plot1 <- grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2)
+
+# Display the combined plot
+plot1
+
+
+
+```
+
+
+#Saving Quality Control Figures
+```{r}
+ggsave(
+  filename = "QCmetrics.tiff", plot = plot1,path = "/projects/p31275/Isaac/MERTK/Figures", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+```
+
+
+```{r Genes versus UMI Correlations, echo=TRUE, message=FALSE, warning=FALSE}
+
+#Correlation of genes v. UMI
+plot2 <- metadata %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "deepskyblue3", high = "firebrick4") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+
+
+plot2
+```
+
+#Saving Genes vs UMI correlations
+```{r  eval=FALSE, include=FALSE}
+
+# Save the nGene vs nUMI plot to a file
+ggsave(
+  filename = "nGene_v_nUMI.tiff", plot = plot2, path = "/projects/p31275/Isaac/MERTK/Figures/QC_Round1", device = "tiff", dpi = 500, width = 7, height = 5, units = "in", compression = "lzw"
+)
+```
+
+
+#################################################
+     FILTERING CELLS BASED ON QC METRICS 
+#################################################
+
+1. Cell-Level filtering 
+Removal of low quality cells:
+nUMI > 500
+nGene > 250
+log10GenesPerUMI > 0.8
+mitoRatio < 0.3
+
+2. Gene-Level Filtering 
+Removal of genes with zero counts 
+
+3. keeping Genes expressed in >= 10 cells 
+
+```{r Filtered_seurat, include = FALSE}
+
+filtered_seurat <- subset(x = merged_seurat, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+filtered_seurat <- JoinLayers(filtered_seurat)
+counts <- GetAssayData(filtered_seurat, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+filtered_seurat <- subset(filtered_seurat, features = rownames(counts)[keep_genes])
+
+```
+
+
+
+### Revisiting QC Metrics with Filtered Data
+```{r QC_metrics_revisted, include = FALSE}
+
+metadata2 <- filtered_seurat@meta.data
+#nCells
+p7 <- metadata2 %>% 
+  ggplot(aes(x=sample, fill=sample)) + 
+  geom_bar() +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nCells") +
+  NoLegend()
+
+#nUMIs
+p8 <- metadata2 %>% 
+  ggplot(aes(color=sample, x=nUMI, fill= sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  ylab("Cell density") +
+  geom_vline(xintercept = 500) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nUMIS")
+
+#nGenes 
+p9 <- metadata2 %>% 
+  ggplot(aes(x=sample, y=log10(nGene), fill=sample)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("nGenes") +
+  NoLegend()
+
+#mito counts ratio
+p10 <- metadata2 %>% 
+  ggplot(aes(color=sample, x=mitoRatio, fill=sample)) + 
+  geom_density(alpha = 0.1) + 
+  scale_x_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 0.6) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Mito Ratio") +
+  NoLegend()
+
+#ribo counts ratio
+p11 <- metadata2 %>% 
+  ggplot(aes(color=sample, x=riboRatio, fill=sample)) + 
+  geom_density(alpha = 0.2) + 
+  scale_x_log10() + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Ribo Ratio") +
+  NoLegend()
+
+#novelty gene
+p12 <- metadata2 %>%
+  ggplot(aes(x=log10GenesPerUMI, color = sample, fill=sample)) +
+  geom_density(alpha = 0.2) +
+  theme_classic() +
+  geom_vline(xintercept = 0.8) +
+  theme(plot.title = element_text(hjust=0.5, face="bold")) +
+  ggtitle("Unique genes per UMI") +
+  NoLegend()
+
+p13 <- metadata2 %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "deepskyblue3", high = "firebrick4") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+table(metadata$sample)
+
+
+# Combine all plots into a single grid
+library(gridExtra)
+plot3 <- grid.arrange(p1, p2, p3, p4, p5, p6, ncol = 2)
+
+# Display the combined plot
+plot3
+
+```
+
+
+
+#Saving Quality Control Figures
+```{r}
+
+ggsave(
+  filename = "QCmetrics_revisited.tiff", plot = plot3,path = "/projects/p31275/Isaac/MERTK/Figures/QC_Round2", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+```
+
+
+
+```{r Genes versus UMI Correlations_revisited, echo=TRUE, message=FALSE, warning=FALSE}
+
+#Correlation of genes v. UMI
+plot4 <- metadata2 %>% 
+  ggplot(aes(x=nUMI, y=nGene, color=mitoRatio)) + 
+  geom_point() + 
+  scale_colour_gradient(low = "deepskyblue3", high = "firebrick4") +
+  stat_smooth(method=lm) +
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_classic() +
+  geom_vline(xintercept = 500) +
+  geom_hline(yintercept = 250) +
+  facet_wrap(~sample)
+
+
+plot4
+```
+
+#Saving Genes vs UMI correlations
+```{r  eval=FALSE, include=FALSE}
+
+# Save the nGene vs nUMI plot to a file
+ggsave(
+  filename = "nGene_v_nUMI_revisited.tiff", plot = plot4, path = "/projects/p31275/Isaac/MERTK/Figures/QC_Round2", device = "tiff", dpi = 500, width = 7, height = 5, units = "in", compression = "lzw"
+)
+
+
+```
+
+
+
+
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+1. Normalizing the gene expression values and identifying variant genes
+Expression counts must be comparable between genes/samples (account for sequencing depth and gene length)
+
+2. Scaling 
+  - first step to normalization is to multiply each UMI count by a cell specific factor to get all cells to have the same UMI count 
+  -Different cells have different amounts of mRNA (*differences in cell types/ variations)
+  
+3. Log Transformation
+- log transformation: issue is that genes with different abundances are affected differently 
+- effective normalization is observed with low/medium abundance genes
+
+4. SCT Transform - Pearson Residual 
+-Pearson Residual --> measurements are multiplied by a gene-specific weight
+- each gene is weighted based on how much evidence there is that it is non-uniformly expressed across cells
+- genes expressed in small fraction of cells will be favored (useful for finding rare cell populations)
+- accounts for both the expression level but also the distribution of that expression across all cells 
+
+```{r}
+#Normalize the counts
+Normalized_seurat <-NormalizeData(filtered_seurat)
+
+seurat_phase <- CellCycleScoring(Normalized_seurat, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+
+```
+
+
+The metadata now of the seurat object contains the assigned phase of the cycle for each cell
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_phase <- FindVariableFeatures(seurat_phase, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_phase <- ScaleData(seurat_phase)
+
+```
+
+
+```{r}
+
+# Perform PCA
+seurat_phase <- RunPCA(seurat_phase)
+# Plot the PCA colored by cell cycle phase
+plot5 <- DimPlot(seurat_phase,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot5
+```
+
+
+#Saving Quality Figures
+```{r eval= FALSE, include=FALSE}
+
+ggsave(
+  filename = "Cell_phase.tiff", plot = plot5, path = "/projects/p31275/Isaac/MERTK/Figures", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+```
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_phase,"/projects/p31275/Isaac/MERTK/DATA/seurat_phase.rds")
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+
+```{r Analysis without Integration, include = FALSE}
+
+library(SeuratData)
+
+
+# Creating a combined grouping factor (WT_Neo, WT_Adult, KO_Adult, KO_Neonatal)
+seurat_phase$group <- paste(seurat_phase$sample, seurat_phase$age_group, sep = "_")
+
+# Splitting the RNA assay using this combined factor
+seurat_phase[["RNA"]] <- split(seurat_phase[["RNA"]], f = seurat_phase$group)
+
+seurat_phase <- Seurat::SCTransform(seurat_phase, method = "glmGamPoi")
+
+seurat_phase <- RunPCA(seurat_phase)
+seurat_phase <- RunUMAP(seurat_phase, dims = 1:30)
+
+#Plotting by Sample
+sample_no_integration <- DimPlot(seurat_phase, reduction = "umap", group.by = "sample")
+
+
+#Plotting by age_group
+age_group_no_integration <- DimPlot(seurat_phase, reduction = "umap", group.by = "age_group")
+
+#Plotting by sample and age_group =  (group)
+group_no_integration <- DimPlot(seurat_phase, reduction = "umap", group.by = "group")
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+#Saving No Integration  Figures
+```{r eval= FALSE, include=FALSE}
+
+ggsave(
+  filename = "Sample.tiff", plot = sample_no_integration, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_NO_Integration", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+ggsave(
+  filename = "Age_Group.tiff", plot = age_group_no_integration, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_NO_Integration", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+
+ggsave(
+  filename = "Group.tiff", plot = group_no_integration, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_NO_Integration", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+```
+
+
+
+# ── CCA Integration───────────────
+# Harmony was selected over CCA and MNN based on UMAP mixing quality.
+# These chunks are retained for reproducibility but not used downstream.
+```{r Analysis with Integration - Integrating Datasets, eval= FALSE}
+
+seurat_phase <- IntegrateLayers(object = seurat_phase, method = CCAIntegration, normalization.method = "SCT", verbose = F)
+seurat_phase <- FindNeighbors(seurat_phase, reduction = "integrated.dr", dims = 1:30)
+seurat_phase <- FindClusters(seurat_phase, resolution = 0.6)
+
+seurat_phase <- RunUMAP(seurat_phase, dims = 1:30, reduction = "integrated.dr")
+
+#Plotting by Sample (Integrated)
+sample_integration <- DimPlot(seurat_phase, reduction = "umap", group.by = "sample")
+
+#Plotting by age_group (Integrated)
+age_group_integration <- DimPlot(seurat_phase, reduction = "umap", group.by = "age_group")
+
+#Plotting by sample and age_group =  (group) (Integrated)
+group_integration <- DimPlot(seurat_phase, reduction = "umap", group.by = "group")
+
+```
+
+
+
+#Saving  Integration  Figures
+```{r eval= FALSE}
+
+ggsave(
+  filename = "Sample.tiff", plot = sample_integration, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_Integration_(Seurat CCA)", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+ggsave(
+  filename = "Age_Group.tiff", plot = age_group_integration, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_Integration_(Seurat CCA)", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+
+ggsave(
+  filename = "Group.tiff", plot = group_integration, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_Integration_(Seurat CCA)", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+```
+
+
+
+####SAVING OBJECT######
+```{r eval=FALSE}
+saveRDS(seurat_phase, "/projects/p31275/Isaac/MERTK/DATA/seurat_cca.rds")
+
+```
+
+
+########################################
+Differential Expression Analysis 
+########################################
+
+
+
+
+####HARMONY INTEGRATION######
+```{r Harmony Batch Correction, include=FALSE}
+
+library(Seurat)
+library(harmony)
+
+# Set SCT as default assay
+DefaultAssay(seurat_phase) <- "SCT"
+
+#Confirming variable features are set
+head(VariableFeatures(seurat_phase))
+
+# Dimensionality reduction
+seurat_phase <- RunPCA(seurat_phase, npcs = 50)
+
+# Harmony on PCA embeddings, correcting for seq_folder
+seurat_phase$seq_folder <- as.factor(seurat_phase$seq_folder)
+seurat_phase <- RunHarmony(seurat_phase, group.by.vars = "seq_folder")
+
+# UMAP on Harmony embeddings
+seurat_phase <- RunUMAP(seurat_phase, reduction = "harmony", dims = 1:30)
+
+
+#Visualization by biological Conditions
+sample_harmony <- DimPlot(seurat_phase, reduction = "umap", group.by = "sample")       
+age_group_harmony <- DimPlot(seurat_phase, reduction = "umap", group.by = "age_group")     
+group_harmony  <- DimPlot(seurat_phase, reduction = "umap", group.by = "group")         
+
+
+sample_harmony
+age_group_harmony
+group_harmony
+
+
+
+
+
+```
+
+
+
+
+
+
+
+#Saving  Harmony  Figures
+```{r eval= FALSE, include=FALSE}
+
+ggsave(
+  filename = "Sample.tiff", plot = sample_harmony, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_Harmony", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+ggsave(
+  filename = "Age_Group.tiff", plot = age_group_harmony, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_Harmony", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+
+ggsave(
+  filename = "Group.tiff", plot = group_harmony, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_Harmony", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+```
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_phase, "/projects/p31275/Isaac/MERTK/DATA/seurat_harmony.rds")
+
+```
+
+
+
+
+# ── CCA Integration ───────────────
+# Harmony was selected over CCA and MNN based on UMAP mixing quality.
+# These chunks are retained for reproducibility but not used downstream.
+```{r}
+
+# Load required libraries
+library(Seurat)
+library(SingleCellExperiment)
+library(batchelor)
+
+# 1. Split the SCTransformed Seurat object by technical batch (seq_folder)
+split_seurat <- SplitObject(seurat_phase, split.by = "seq_folder")
+
+# 2. Make sure SCT is the default assay in each split object
+split_seurat <- lapply(split_seurat, function(obj) {
+  DefaultAssay(obj) <- "SCT"
+  return(obj)
+})
+
+# 3. Extract variable features for integration
+integration.features <- Reduce(intersect, lapply(split_seurat, VariableFeatures))
+cat("Number of common variable features:", length(integration.features), "\n")
+
+# 4. Convert Seurat objects to SingleCellExperiment (SCE) format
+sce_list <- lapply(split_seurat, as.SingleCellExperiment)
+
+# 5. Subset each SCE to common variable features
+sce_list <- lapply(sce_list, function(sce) {
+  sce[rownames(sce) %in% integration.features, ]
+})
+
+# 6. Run fastMNN to batch correct across seq_folder
+mnn_out <- fastMNN(sce_list, d = 30)
+
+# 7. Convert the "reconstructed" assay to a standard matrix
+assay(mnn_out, "reconstructed") <- as.matrix(assay(mnn_out, "reconstructed"))
+
+# 8. Convert integrated SCE back to Seurat object
+seurat_mnn <- as.Seurat(mnn_out, counts = "reconstructed", data = "reconstructed")
+
+# 9. Add corrected embeddings from fastMNN
+seurat_mnn[["mnn"]] <- CreateDimReducObject(
+  embeddings = reducedDim(mnn_out, "corrected"),
+  key = "MNN_",
+  assay = DefaultAssay(seurat_mnn)
+)
+
+# 10. Run UMAP on MNN reduction
+seurat_mnn <- RunUMAP(seurat_mnn, reduction = "mnn", dims = 1:30)
+
+#Recover metadata 
+seurat_mnn@meta.data <- seurat_phase@meta.data[colnames(seurat_mnn), ]
+
+# 11. Visualize
+plot6 <- DimPlot(seurat_mnn, reduction = "umap", group.by = "sample")       # WT vs KO
+plot7 <- DimPlot(seurat_mnn, reduction = "umap", group.by = "age_group")    # Neonatal vs Adult
+plot8 <- DimPlot(seurat_mnn, reduction = "umap", group.by = "group")        # Composite groups
+
+plot6
+plot7
+plot8
+
+
+```
+
+
+
+#Saving  MNN  Figures
+```{r eval= FALSE, include=FALSE}
+
+ggsave(
+  filename = "Sample.tiff", plot = plot6, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_MNN", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+ggsave(
+  filename = "Age_Group.tiff", plot = plot7, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_MNN", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+
+ggsave(
+  filename = "Group.tiff", plot = plot8, path = "/projects/p31275/Isaac/MERTK/Figures/UMAP_MNN", device = "tiff", dpi = 500, width = 7, height = 7, units = "in",compression = "lzw"
+)
+
+```
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_mnn, "/projects/p31275/Isaac/MERTK/DATA/seurat_mnn.rds")
+
+```
+
+
+
+#################################################
+ATLAS CREATION 
+ATLAS CREATION
+ATLAS CREATION
+################################################
+
+
+
+
+#NORMALIZATION OF DATASET W/ ACCESSION E-MTAB-13264
+
+
+```{r Normalizing Dataset ACCESSION: E-MTAB-13264}
+
+
+seurat_13264 <- readRDS("/projects/p31275/Isaac/MERTK/Atlas_Datasets/E-MTAB-13264.rds")
+
+#Checking metadata
+table(seurat_13264$condition)
+#selecting HFrEF condition
+seurat_13264_HF <- subset(seurat_13264, subset = condition == "Mice-HFrEF")
+
+#saving original clusters:
+seurat_13264_HF$orig_cluster <- Idents(seurat_13264_HF)
+
+
+```
+
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+# Quality Control Setup
+DefaultAssay(seurat_13264_HF) <- "RNA"
+
+# Human patterns due to multi-species atlas: use MT-, RPS, RPL 
+seurat_13264_HF[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_13264_HF,
+  pattern = "^MT-"
+)
+
+seurat_13264_HF[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_13264_HF,
+  pattern = "^RP[SL]"
+)
+
+# Convert to ratios
+seurat_13264_HF$mitoRatio <- seurat_13264_HF$percent.mito / 100
+seurat_13264_HF$riboRatio <- seurat_13264_HF$percent.ribo / 100
+
+```
+
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_13264_HF <- seurat_13264_HF@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_13264_HF <- metadata_13264_HF %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+
+# Assign back to Seurat object
+seurat_13264_HF@meta.data <- metadata_13264_HF
+seurat_13264_HF$log10GenesPerUMI <- log10(seurat_13264_HF$nGene) / log10(seurat_13264_HF$nUMI)
+
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_13264_HF <- subset(x = seurat_13264_HF, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Get raw counts slot
+counts <- GetAssayData(seurat_13264_HF, assay = "RNA", slot = "counts")
+
+# Filter genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_13264_HF <- subset(seurat_13264_HF, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_13264_HF <-NormalizeData(seurat_13264_HF)
+
+seurat_13264_HF <- CellCycleScoring(seurat_13264_HF, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+
+
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_13264_HF <- FindVariableFeatures(seurat_13264_HF, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_13264_HF <- ScaleData(seurat_13264_HF)
+
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_13264_HF <- RunPCA(seurat_13264_HF)
+# Plot the PCA colored by cell cycle phase
+plot19 <- DimPlot(seurat_13264_HF,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot19
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+NormalizeData, FindVariableFeatures, ScaleData and RunPCA were run above for cell-cycle scoring
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+library(glmGamPoi)
+
+seurat_13264_HF <- Seurat::SCTransform(seurat_13264_HF, method = "glmGamPoi")
+
+seurat_13264_HF <- RunPCA(seurat_13264_HF)
+seurat_13264_HF <- RunUMAP( seurat_13264_HF, dims = 1:30)
+
+
+```
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_13264_HF, "/projects/p31275/Isaac/MERTK/DATA/seurat_13264_HF.rds")
+
+```
+
+
+
+
+
+
+
+
+
+
+#NORMALIZATION OF DATASET W/ ACCESSION EMTAB9816
+
+```{r}
+
+#---------------------
+#.     MI@1D
+#--------------------
+
+counts_9816_1d <- Read10X( data.dir= "/projects/p31275/Isaac/MERTK/Atlas_Datasets/EMTAB9816/MI1D")
+
+seurat_9816_1d <- CreateSeuratObject(counts = counts_9816_1d, project = "EMTAB9816_MI1D")
+
+
+```
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+seurat_9816_1d[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_9816_1d,
+  pattern = "^mt-"
+)
+
+seurat_9816_1d[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_9816_1d,
+  pattern = "^Rp[sl]"
+)
+
+# Convert to ratios
+seurat_9816_1d$mitoRatio <- seurat_9816_1d$percent.mito / 100
+seurat_9816_1d$riboRatio <- seurat_9816_1d$percent.ribo / 100
+
+```
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_9816_1d <- seurat_9816_1d@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_9816_1d <- metadata_9816_1d %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+seurat_9816_1d@meta.data <- metadata_9816_1d
+seurat_9816_1d$log10GenesPerUMI <- log10(seurat_9816_1d$nFeature_RNA) / log10(seurat_9816_1d$nCount_RNA)
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_9816_1d <- subset(x = seurat_9816_1d, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+counts <- GetAssayData(seurat_9816_1d, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_9816_1d <- subset(seurat_9816_1d, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_9816_1d <-NormalizeData(seurat_9816_1d)
+
+seurat_9816_1d <- CellCycleScoring(seurat_9816_1d, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_9816_1d <- FindVariableFeatures(seurat_9816_1d, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_9816_1d <- ScaleData(seurat_9816_1d)
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_9816_1d <- RunPCA(seurat_9816_1d)
+# Plot the PCA colored by cell cycle phase
+plot15 <- DimPlot(seurat_9816_1d,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot15
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+Twist: At this point, NormalizeData, FindVariableFeatures, ScaleData, RunPCA have already been completed 
+
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+
+seurat_9816_1d <- Seurat::SCTransform(seurat_9816_1d, method = "glmGamPoi")
+
+seurat_9816_1d <- RunPCA(seurat_9816_1d)
+seurat_9816_1d <- RunUMAP( seurat_9816_1d, dims = 1:30)
+
+
+
+```
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_9816_1d, "/projects/p31275/Isaac/MERTK/DATA/seurat_9816_1d.rds")
+
+```
+
+
+
+
+
+
+
+
+#-----------------
+#EMTAB9816 MI3D
+#-----------------
+
+
+
+```{r}
+
+#---------------------
+#.     MI@3D
+#--------------------
+count_9816_3d <- Read10X( data.dir= "/projects/p31275/Isaac/MERTK/Atlas_Datasets/EMTAB9816/MI3D")
+
+seurat_9816_3d <- CreateSeuratObject(counts = count_9816_3d, project = "EMTAB9816_MI3D")
+```
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+seurat_9816_3d[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_9816_3d,
+  pattern = "^mt-"
+)
+
+seurat_9816_3d[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_9816_3d,
+  pattern = "^Rp[sl]"
+)
+
+# Convert to ratios
+seurat_9816_3d$mitoRatio <- seurat_9816_3d$percent.mito / 100
+seurat_9816_3d$riboRatio <- seurat_9816_3d$percent.ribo / 100
+
+```
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_9816_3d <- seurat_9816_3d@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_9816_3d <- metadata_9816_3d %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+seurat_9816_3d@meta.data <- metadata_9816_3d
+seurat_9816_3d$log10GenesPerUMI <- log10(seurat_9816_3d$nFeature_RNA) / log10(seurat_9816_3d$nCount_RNA)
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_9816_3d <- subset(x = seurat_9816_3d, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+counts <- GetAssayData(seurat_9816_3d, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_9816_3d <- subset(seurat_9816_3d, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_9816_3d <-NormalizeData(seurat_9816_3d)
+
+seurat_9816_3d <- CellCycleScoring(seurat_9816_3d, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_9816_3d <- FindVariableFeatures(seurat_9816_3d, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_9816_3d <- ScaleData(seurat_9816_3d)
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_9816_3d <- RunPCA(seurat_9816_3d)
+# Plot the PCA colored by cell cycle phase
+plot15 <- DimPlot(seurat_9816_3d,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot15
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+Twist: At this point, NormalizeData, FindVariableFeatures, ScaleData, RunPCA have already been completed 
+
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+
+seurat_9816_3d <- Seurat::SCTransform(seurat_9816_3d, method = "glmGamPoi")
+
+seurat_9816_3d <- RunPCA(seurat_9816_3d)
+seurat_9816_3d <- RunUMAP( seurat_9816_3d, dims = 1:30)
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_9816_3d, "/projects/p31275/Isaac/MERTK/DATA/seurat_9816_3d.rds")
+
+```
+
+
+
+
+
+
+
+#-----------------
+#EMTAB9816 MI7D
+#-----------------
+
+
+```{r}
+
+#---------------------
+#.     MI@7D
+#--------------------
+count_9816_7d <- Read10X( data.dir= "/projects/p31275/Isaac/MERTK/Atlas_Datasets/EMTAB9816/MI7D")
+
+seurat_9816_7d <- CreateSeuratObject(counts = count_9816_7d, project = "EMTAB9816_MI7D")
+
+```
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+seurat_9816_7d[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_9816_7d,
+  pattern = "^mt-"
+)
+
+seurat_9816_7d[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_9816_7d,
+  pattern = "^Rp[sl]"
+)
+
+# Convert to ratios
+seurat_9816_7d$mitoRatio <- seurat_9816_7d$percent.mito / 100
+seurat_9816_7d$riboRatio <- seurat_9816_7d$percent.ribo / 100
+
+```
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_9816_7d <- seurat_9816_7d@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_9816_7d <- metadata_9816_7d %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+seurat_9816_7d@meta.data <- metadata_9816_7d
+seurat_9816_7d$log10GenesPerUMI <- log10(seurat_9816_7d$nFeature_RNA) / log10(seurat_9816_7d$nCount_RNA)
+
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_9816_7d <- subset(x = seurat_9816_7d, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+counts <- GetAssayData(seurat_9816_7d, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_9816_7d <- subset(seurat_9816_7d, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_9816_7d <-NormalizeData(seurat_9816_7d)
+
+seurat_9816_7d <- CellCycleScoring(seurat_9816_7d, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_9816_7d <- FindVariableFeatures(seurat_9816_7d, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_9816_7d <- ScaleData(seurat_9816_7d)
+
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_9816_7d <- RunPCA(seurat_9816_7d)
+# Plot the PCA colored by cell cycle phase
+plot15 <- DimPlot(seurat_9816_7d,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot15
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+Twist: At this point, NormalizeData, FindVariableFeatures, ScaleData, RunPCA have already been completed 
+
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+
+seurat_9816_7d <- Seurat::SCTransform(seurat_9816_7d, method = "glmGamPoi")
+
+seurat_9816_7d <- RunPCA(seurat_9816_7d)
+seurat_9816_7d <- RunUMAP( seurat_9816_7d, dims = 1:30)
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_9816_7d, "/projects/p31275/Isaac/MERTK/DATA/seurat_9816_7d.rds")
+
+```
+
+
+
+
+#NORMALIZATION OF DATASET W/ ACCESSION GSE119355
+
+
+```{r}
+
+counts_Epelman <- Read10X(data.dir = "/projects/p31275/Isaac/MERTK/Atlas_Datasets/GSE119355")
+
+seurat_Epelman <- CreateSeuratObject(counts = counts_Epelman, project = "GSE119355")
+
+
+
+```
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+seurat_Epelman[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_Epelman,
+  pattern = "^mt-"
+)
+
+seurat_Epelman[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_Epelman,
+  pattern = "^Rp[sl]"
+)
+
+# Convert to ratios
+seurat_Epelman$mitoRatio <- seurat_Epelman$percent.mito / 100
+seurat_Epelman$riboRatio <- seurat_Epelman$percent.ribo / 100
+```
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_Epelman <- seurat_Epelman@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_Epelman <- metadata_Epelman %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+seurat_Epelman@meta.data <- metadata_Epelman
+seurat_Epelman$log10GenesPerUMI <- log10(seurat_Epelman$nFeature_RNA) / log10(seurat_Epelman$nCount_RNA)
+
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_Epelman <- subset(x =seurat_Epelman, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+counts <- GetAssayData(seurat_Epelman, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_Epelman <- subset(seurat_Epelman, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_Epelman <-NormalizeData(seurat_Epelman)
+
+seurat_Epelman <- CellCycleScoring(seurat_Epelman, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_Epelman <- FindVariableFeatures(seurat_Epelman, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_Epelman <- ScaleData(seurat_Epelman)
+
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_Epelman <- RunPCA(seurat_Epelman)
+# Plot the PCA colored by cell cycle phase
+plot15 <- DimPlot(seurat_Epelman,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot15
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+Twist: At this point, NormalizeData, FindVariableFeatures, ScaleData, RunPCA have already been completed 
+
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+
+seurat_Epelman <- Seurat::SCTransform(seurat_Epelman, method = "glmGamPoi")
+
+seurat_Epelman <- RunPCA(seurat_Epelman)
+seurat_EPelman <- RunUMAP(seurat_Epelman, dims = 1:30)
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_Epelman, "/projects/p31275/Isaac/MERTK/DATA/seurat_Epelman.rds")
+
+```
+
+
+
+
+
+
+
+
+
+
+#NORMALIZATION OF DATASET W/ ACCESSION EMTAB7895
+
+
+```{r}
+
+#---------------------
+#.     MI@1D
+#--------------------
+
+counts_7895_1d <- Read10X(data.dir = "/projects/p31275/Isaac/MERTK/Atlas_Datasets/EMTAB7895/MI1D/filtered_feature_bc_matrix")
+
+seurat_7895_1d <- CreateSeuratObject(counts = counts_7895_1d, project = "EMTAB7895_1d")
+```
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+seurat_7895_1d[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_7895_1d,
+  pattern = "^mt-"
+)
+
+seurat_7895_1d[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_7895_1d,
+  pattern = "^Rp[sl]"
+)
+
+# Convert to ratios
+seurat_7895_1d$mitoRatio <- seurat_7895_1d$percent.mito / 100
+seurat_7895_1d$riboRatio <- seurat_7895_1d$percent.ribo / 100
+```
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_7895_1d <- seurat_7895_1d@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_7895_1d <- metadata_7895_1d %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+seurat_7895_1d@meta.data <- metadata_7895_1d
+seurat_7895_1d$log10GenesPerUMI <- log10(seurat_7895_1d$nFeature_RNA) / log10(seurat_7895_1d$nCount_RNA)
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_7895_1d <- subset(x =seurat_7895_1d, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+counts <- GetAssayData(seurat_7895_1d, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_7895_1d <- subset(seurat_7895_1d, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_7895_1d <-NormalizeData(seurat_7895_1d)
+
+seurat_7895_1d <- CellCycleScoring(seurat_7895_1d, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_7895_1d <- FindVariableFeatures(seurat_7895_1d, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_7895_1d <- ScaleData(seurat_7895_1d)
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_7895_1d <- RunPCA(seurat_7895_1d)
+# Plot the PCA colored by cell cycle phase
+plot15 <- DimPlot(seurat_7895_1d,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot15
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+Twist: At this point, NormalizeData, FindVariableFeatures, ScaleData, RunPCA have already been completed 
+
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+
+seurat_7895_1d <- Seurat::SCTransform(seurat_7895_1d, method = "glmGamPoi")
+
+seurat_7895_1d <- RunPCA(seurat_7895_1d)
+seurat_7895_1d <- RunUMAP(seurat_7895_1d, dims = 1:30)
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_7895_1d, "/projects/p31275/Isaac/MERTK/DATA/seurat_7895_1d.rds")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+#--------------------
+#EMTAB7895 3D
+#--------------------
+
+
+```{r}
+
+#---------------------
+#.     MI@3D
+#--------------------
+
+counts_7895_3d <- Read10X(data.dir = "/projects/p31275/Isaac/MERTK/Atlas_Datasets/EMTAB7895/MI3D/filtered_feature_bc_matrix")
+
+seurat_7895_3d <- CreateSeuratObject(counts = counts_7895_3d, project = "EMTAB7895_3d")
+```
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+seurat_7895_3d[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_7895_3d,
+  pattern = "^mt-"
+)
+
+seurat_7895_3d[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_7895_3d,
+  pattern = "^Rp[sl]"
+)
+
+# Convert to ratios
+seurat_7895_3d$mitoRatio <- seurat_7895_3d$percent.mito / 100
+seurat_7895_3d$riboRatio <- seurat_7895_3d$percent.ribo / 100
+```
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_7895_3d <- seurat_7895_3d@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_7895_3d <- metadata_7895_3d %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+seurat_7895_3d@meta.data <- metadata_7895_3d
+seurat_7895_3d$log10GenesPerUMI <- log10(seurat_7895_3d$nFeature_RNA) / log10(seurat_7895_3d$nCount_RNA)
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_7895_3d <- subset(x =seurat_7895_3d, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+counts <- GetAssayData(seurat_7895_3d, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_7895_3d <- subset(seurat_7895_3d, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_7895_3d <-NormalizeData(seurat_7895_3d)
+
+seurat_7895_3d <- CellCycleScoring(seurat_7895_3d, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_7895_3d <- FindVariableFeatures(seurat_7895_3d, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_7895_3d <- ScaleData(seurat_7895_3d)
+
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_7895_3d <- RunPCA(seurat_7895_3d)
+# Plot the PCA colored by cell cycle phase
+plot15 <- DimPlot(seurat_7895_3d,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot15
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+Twist: At this point, NormalizeData, FindVariableFeatures, ScaleData, RunPCA have already been completed 
+
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+
+seurat_7895_3d <- Seurat::SCTransform(seurat_7895_3d, method = "glmGamPoi")
+
+seurat_7895_3d <- RunPCA(seurat_7895_3d)
+seurat_7895_3d <- RunUMAP(seurat_7895_3d, dims = 1:30)
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_7895_3d, "/projects/p31275/Isaac/MERTK/DATA/seurat_7895_3d.rds")
+
+```
+
+
+
+
+#----------------
+#EMTAB7895
+#---------------
+
+
+```{r}
+
+#---------------------
+#.     MI@7D
+#--------------------
+
+counts_7895_7d <- Read10X(data.dir = "/projects/p31275/Isaac/MERTK/Atlas_Datasets/EMTAB7895/MI7D/filtered_feature_bc_matrix")
+
+seurat_7895_7d <- CreateSeuratObject(counts = counts_7895_7d, project = "EMTAB7895_7d")
+```
+
+
+#Quality Control
+
+```{r Quality Control, include = False}
+
+seurat_7895_7d[["percent.mito"]] <- PercentageFeatureSet(
+  object = seurat_7895_7d,
+  pattern = "^mt-"
+)
+
+seurat_7895_7d[["percent.ribo"]] <- PercentageFeatureSet(
+  object = seurat_7895_7d,
+  pattern = "^Rp[sl]"
+)
+
+# Convert to ratios
+seurat_7895_7d$mitoRatio <- seurat_7895_7d$percent.mito / 100
+seurat_7895_7d$riboRatio <- seurat_7895_7d$percent.ribo / 100
+```
+
+
+
+#Meta Data Annotation
+```{r Meta Data Annotation, include=FALSE}
+
+# Extract metadata
+metadata_7895_7d <- seurat_7895_7d@meta.data
+
+# Assign metadata based on orig.ident patterns
+metadata_7895_7d <- metadata_7895_7d %>%
+  mutate(
+    seq_folder = orig.ident,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+seurat_7895_7d@meta.data <- metadata_7895_7d
+seurat_7895_7d$log10GenesPerUMI <- log10(seurat_7895_7d$nFeature_RNA) / log10(seurat_7895_7d$nCount_RNA)
+```
+
+
+
+```{r Filtered_seurat, include = False}
+
+seurat_7895_7d <- subset(x =seurat_7895_7d, 
+                          subset = (nUMI >= 500) & 
+                                   (nGene >= 250) & 
+                                   (log10GenesPerUMI > 0.80) & 
+                                   (mitoRatio < 0.30))
+
+# Collapse layers into one count matrix
+counts <- GetAssayData(seurat_7895_7d, assay = "RNA", layer = "counts")
+
+# Keep genes expressed in ≥10 cells
+keep_genes <- rowSums(counts > 0) >= 10
+seurat_7895_7d <- subset(seurat_7895_7d, features = rownames(counts)[keep_genes])
+
+```
+
+
+#################################################
+        Cell Cycle Variability  
+#################################################
+
+```{r}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+#Convert human cell-cycle genes to mouse title case
+s_genes <- str_to_title(s.genes)
+g2m_genes <- str_to_title(g2m.genes)
+
+```
+
+
+#################################################
+    Normalization and Variability Regression
+#################################################
+
+```{r}
+#Normalize the counts
+seurat_7895_7d <-NormalizeData(seurat_7895_7d)
+
+seurat_7895_7d <- CellCycleScoring(seurat_7895_7d, 
+                                 g2m.features = g2m_genes, 
+                                 s.features = s_genes)
+```
+
+
+
+
+#################################################
+                  PCA Analysis 
+#################################################
+
+```{r}
+
+# Identify the most variable genes
+seurat_7895_7d <- FindVariableFeatures(seurat_7895_7d, 
+                     selection.method = "vst",
+                     nfeatures = 2000, 
+                     verbose = FALSE)
+		     
+# Scale the counts
+seurat_7895_7d <- ScaleData(seurat_7895_7d)
+
+```
+
+
+
+```{r}
+
+# Perform PCA
+seurat_7895_7d <- RunPCA(seurat_7895_7d)
+# Plot the PCA colored by cell cycle phase
+plot15 <- DimPlot(seurat_7895_7d,
+        reduction = "pca",
+        group.by= "Phase",
+        split.by = "Phase")
+
+plot15
+```
+
+
+
+
+
+#################################################
+     SCT TRANSFORM & DATA INTEGRATION 
+#################################################
+
+1. Performing the Analysis without Integration (https://satijalab.org/seurat/articles/integration_introduction#perform-integration-with-sctransform-normalized-datasets)
+
+Twist: At this point, NormalizeData, FindVariableFeatures, ScaleData, RunPCA have already been completed 
+
+
+```{r SCTransform, include = FALSE}
+
+library(SeuratData)
+
+seurat_7895_7d <- Seurat::SCTransform(seurat_7895_7d, method = "glmGamPoi")
+
+seurat_7895_7d <- RunPCA(seurat_7895_7d)
+seurat_7895_7d <- RunUMAP(seurat_7895_7d, dims = 1:30)
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_7895_7d, "/projects/p31275/Isaac/MERTK/DATA/seurat_7895_7d.rds")
+
+```
+
+
+
+
+
+
+
+#-----------------------------------------------
+# MERGING ATLAS SEURAT OBJECTS 
+
+
+
+# MERGING ATLAS SEURAT OBJECTS 
+
+
+
+# MERGING ATLAS SEURAT OBJECTS 
+#----------------------------------------------
+
+```{r Building/Loading gene_map}
+
+library(biomaRt)
+mart <- useMart(biomart = "ENSEMBL_MART_ENSEMBL", dataset = "mmusculus_gene_ensembl")
+
+gene_map <- getBM(
+  attributes = c("mgi_symbol", "ensembl_gene_id"),
+  mart = mart
+)
+gene_map <- gene_map[gene_map$mgi_symbol != "" & gene_map$ensembl_gene_id != "", ]
+gene_map <- unique(gene_map)
+
+write.csv(gene_map,
+          file = "/projects/b1246/Isaac/gene_map_mouse.csv",
+          row.names = FALSE)
+
+
+```
+
+
+
+```{r SCT Integration of all the datasets}
+
+suppressPackageStartupMessages({
+  library(Matrix)
+  library(Seurat)
+})
+
+collapse_sparse_rows <- function(mat, groups) {
+  if (!inherits(mat, "dgCMatrix")) mat <- as(mat, "dgCMatrix")
+  groups <- as.character(groups)
+  ug <- unique(groups)
+  sm <- summary(mat)
+  gi <- match(groups[sm$i], ug)
+  res <- sparseMatrix(
+    i = gi, j = sm$j, x = sm$x,
+    dims = c(length(ug), ncol(mat)),
+    dimnames = list(ug, colnames(mat))
+  )
+  methods::as(res, "dgCMatrix")
+}
+
+map_to_ensembl <- function(counts, symbol_to_ensembl) {
+  old <- rownames(counts)
+  new <- symbol_to_ensembl[old]
+  new_ids <- ifelse(is.na(new), paste0("SYM:", old), new)
+  collapse_sparse_rows(counts, new_ids)
+}
+
+ensure_gene_universe <- function(counts, target_genes) {
+  rn <- rownames(counts)
+  miss <- setdiff(target_genes, rn)
+  if (length(miss)) {
+    z <- sparseMatrix(i = integer(0), j = integer(0), x = numeric(0),
+                      dims = c(length(miss), ncol(counts)),
+                      dimnames = list(miss, colnames(counts)))
+    counts <- rbind(counts, z)
+  }
+  counts[match(target_genes, rownames(counts)), , drop = FALSE]
+}
+
+safe_counts <- function(obj, assay = "RNA") GetAssayData(obj, assay = assay, slot = "counts")
+
+# mapping prep
+symbol_to_ensembl <- setNames(gene_map$ensembl_gene_id, gene_map$mgi_symbol)
+
+
+```
+
+
+
+
+```{r SCT Normalization}
+
+seurat_list <- list(
+  Epelman   = seurat_Epelman,
+  `13264_HF`= seurat_13264_HF,
+  `7895_1d` = seurat_7895_1d,
+  `7895_3d` = seurat_7895_3d,
+  `7895_7d` = seurat_7895_7d,
+  `9816_1d` = seurat_9816_1d,
+  `9816_3d` = seurat_9816_3d,
+  `9816_7d` = seurat_9816_7d
+)
+
+for (nm in names(seurat_list)) {
+  obj <- seurat_list[[nm]]
+  obj <- RenameCells(obj, add.cell.id = nm)
+
+  counts <- safe_counts(obj, assay = "RNA")
+  rownames(counts) <- rownames(counts)  # preserve case
+  counts_mapped <- map_to_ensembl(counts, symbol_to_ensembl)
+
+  obj[["RNA.all"]] <- CreateAssayObject(counts = counts_mapped)
+  DefaultAssay(obj) <- "RNA.all"
+  seurat_list[[nm]] <- obj
+}
+
+all_genes <- Reduce(union, lapply(seurat_list, \(o) rownames(o[["RNA.all"]])))
+
+for (nm in names(seurat_list)) {
+  obj <- seurat_list[[nm]]
+  counts <- GetAssayData(obj, assay = "RNA.all", slot = "counts")
+  counts <- ensure_gene_universe(counts, all_genes)
+  obj[["RNA.all"]] <- CreateAssayObject(counts = counts)
+  DefaultAssay(obj) <- "RNA.all"
+  seurat_list[[nm]] <- obj
+}
+
+# SCTransform normalization
+seurat_list <- lapply(seurat_list, function(o) {
+  DefaultAssay(o) <- "RNA.all"
+  SCTransform(
+    o, assay = "RNA.all", new.assay.name = "SCT",
+    return.only.var.genes = FALSE,
+    conserve.memory = FALSE,
+    verbose = TRUE
+  )
+})
+
+seurat_list <- lapply(seurat_list, function(o) { DefaultAssay(o) <- "SCT"; o })
+
+present_in_both <- function(o) {
+  rc <- rownames(GetAssayData(o, assay = "SCT", slot = "counts"))
+  rd <- rownames(GetAssayData(o, assay = "SCT", slot = "data"))
+  intersect(rc, rd)
+}
+by_obj_both <- lapply(seurat_list, present_in_both)
+
+features_raw <- SelectIntegrationFeatures(object.list = seurat_list, nfeatures = 3000)
+features_use <- Reduce(intersect, c(list(features_raw), by_obj_both))
+features_use <- unique(features_use[nzchar(features_use)])
+stopifnot(length(features_use) >= 2000)
+
+seurat_list <- lapply(seurat_list, function(o) {
+  DefaultAssay(o) <- "SCT"
+  rn <- rownames(o[["SCT"]])
+  if (anyDuplicated(rn)) {
+    m <- GetAssayData(o, assay = "SCT", slot = "counts")
+    keep <- !duplicated(rn)
+    o[["SCT"]] <- CreateAssayObject(counts = m[keep, , drop = FALSE])
+    DefaultAssay(o) <- "SCT"
+  }
+  VariableFeatures(o) <- features_use
+  o
+})
+
+seurat_list <- PrepSCTIntegration(
+  object.list     = seurat_list,
+  anchor.features = features_use,
+  verbose         = TRUE
+)
+
+anchors <- FindIntegrationAnchors(
+  object.list          = seurat_list,
+  normalization.method = "SCT",
+  anchor.features      = features_use,
+  dims                 = 1:30,
+  verbose              = TRUE
+)
+
+seurat_atlas <- IntegrateData(
+  anchorset            = anchors,
+  normalization.method = "SCT",
+  dims                 = 1:30,
+  verbose              = TRUE
+)
+
+DefaultAssay(seurat_atlas) <- "integrated"
+seurat_atlas <- seurat_atlas |>
+  RunPCA(npcs = 30) |>
+  RunUMAP(dims = 1:30) |>
+  FindNeighbors(dims = 1:30) |>
+  FindClusters(resolution = c(0.1,0.2,0.3,0.4, 0.5,0.6,0.7,0.8, 0.9))
+DimPlot(seurat_atlas, reduction = "umap", label = TRUE)
+
+```
+
+
+
+```{r Gene Mapping}
+
+# Load mapping
+gene_map <- read.csv("/scratch/inm3056/gene_map_mouse.csv")
+symbol_to_ensembl <- setNames(gene_map$ensembl_gene_id, toupper(gene_map$mgi_symbol))
+ensembl_to_symbol <- setNames(gene_map$mgi_symbol, gene_map$ensembl_gene_id)
+
+# Helper for DotPlot using gene symbols
+DotPlotSymbols <- function(object, symbols, mapping, group.by) {
+  symbol_to_ens <- setNames(mapping$ensembl_gene_id, toupper(mapping$mgi_symbol))
+  ens_to_symbol <- setNames(mapping$mgi_symbol, mapping$ensembl_gene_id)
+
+  features_map <- symbol_to_ens[toupper(symbols)]
+  features_use <- features_map[!is.na(features_map)]
+
+  p <- DotPlot(object, features = features_use, group.by = group.by) +
+    RotatedAxis() +
+    scale_x_discrete(labels = ens_to_symbol[features_use])
+  return(p)
+}
+
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_atlas, "/scratch/inm3056/seurat_atlas.rds")
+
+```
+
+
+#---------------------------------------------
+CLUSTER ANNOTATIONS FOR THE ATLAS 
+#---------------------------------------------
+
+
+```{r Finding Main Cell Lineage (low resolution)}
+
+DimPlot(seurat_atlas, reduction = "umap", group.by = "integrated_snn_res.0.1", label = TRUE) + ggtitle("Res 0.1")
+DimPlot(seurat_atlas, reduction = "umap", group.by = "integrated_snn_res.0.2", label = TRUE) + ggtitle("Res 0.2")
+DimPlot(seurat_atlas, reduction = "umap", group.by = "integrated_snn_res.0.3", label = TRUE) + ggtitle("Res 0.3")
+DimPlot(seurat_atlas, reduction = "umap", group.by = "integrated_snn_res.0.5", label = TRUE) + ggtitle("Res 0.5")
+DimPlot(seurat_atlas, reduction = "umap", group.by = "integrated_snn_res.0.6", label = TRUE) + ggtitle("Res 0.6")
+DimPlot(seurat_atlas, reduction = "umap", group.by = "integrated_snn_res.0.7", label = TRUE) + ggtitle("Res 0.7")
+DimPlot(seurat_atlas, reduction = "umap", group.by = "integrated_snn_res.0.9", label = TRUE) + ggtitle("Res 0.9")
+
+
+
+```
+
+
+
+
+```{r Myeloid vs Non-myeloid, include = FALSE}
+
+
+# Set identities
+Idents(seurat_atlas) <- "integrated_snn_res.0.2"
+
+# Define marker lists (symbols)
+cell_lineage_0.2 <- list(
+  Myeloid  = c("Lyz2","Itgam","Adgre1","Csf1r","S100a8","S100a9"),
+  Tcell    = c("Cd3e","Cd4","Cd8a"),
+  Bcell    = c("Cd79a","Ms4a1"),
+  Nk       = c("Ncr1","Klrb1c","Gzmb"),
+  Dc       = c("Itgax","H2-Ab1","Cd74"),
+  Endo     = c("Pecam1","Cdh5","Kdr"),
+  Fibro    = c("Col1a1","Pdgfra"),
+  Lec      = c("Prox1","Lyve1","Flt4"),
+  Neut     = c("Ly6g","S100a8"),
+  Eos      = c("Siglecf"),
+  Baso     = c("Fcer1a","Mcpt8")
+)
+
+# Collapse to unique marker symbols
+features_all <- unique(unlist(cell_lineage_0.2))
+
+# Load gene map
+gene_map <- read.csv("/projects/b1246/Isaac/gene_map_mouse.csv")
+
+# Use helper to plot directly with symbols
+p <- DotPlotSymbols(seurat_atlas,
+                    symbols = features_all,
+                    mapping = gene_map,
+                    group.by = "integrated_snn_res.0.2") +
+     ggtitle("Lineage markers across clusters (res 0.2)") +
+     theme(axis.text.x.top = element_blank(),   # remove top labels
+           axis.ticks.x.top = element_blank())  # remove top ticks too
+
+p
+
+
+```
+
+
+
+
+
+
+```{r Cluster mapping}
+
+Idents(seurat_atlas) <- "integrated_snn_res.0.2"
+lv <- levels(seurat_atlas) 
+
+map <- setNames(rep("other", length(lv)), lv)
+
+map[c("0","3","4","5","9")] <- "myeloid"
+map["7"] <- "B cell"
+map["6"] <- "Endothelial"
+map[c("1","2")] <- "Fibroblast"
+map["8"] <- "Nk_T"
+
+# apply without overwriting numeric Idents
+seurat_atlas$lineage_r.02 <- plyr::mapvalues(
+  x = as.character(Idents(seurat_atlas)),
+  from = names(map), to = unname(map), warn_missing = FALSE
+)
+
+
+DimPlot(seurat_atlas, reduction="umap", group.by="lineage_r.02", label=FALSE)
+
+# Sanity Check with helper
+DefaultAssay(seurat_atlas) <- "SCT"
+
+DotPlotSymbols(seurat_atlas,
+               symbols = c("Lyz2","Itgam","Adgre1","Csf1r",   # Myeloid
+                           "Cd3e","Cd4","Cd8a",               # T cell
+                           "Ncr1","Klrb1c","Gzmb",            # NK
+                           "Cd79a","Ms4a1",                   # B
+                           "Pecam1","Cdh5","Kdr",             # Endo
+                           "Col1a1","Pdgfra"),                # Fibro
+               mapping = gene_map,
+               group.by = "lineage_r.02") +
+  ggtitle("Marker check by cell lineage")
+
+
+
+```
+
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_atlas, "/projects/b1246/Isaac/seurat_atlas.rds")
+
+```
+
+
+```{r FeaturePlotSymbols helper function}
+
+FeaturePlotSymbols <- function(object, symbols, mapping, ...) {
+  # Mapping
+  symbol_to_ens <- setNames(mapping$ensembl_gene_id, toupper(mapping$mgi_symbol))
+  ens_to_symbol <- setNames(mapping$mgi_symbol, mapping$ensembl_gene_id)
+  
+  # Convert symbols -> Ensembl IDs
+  features_map <- symbol_to_ens[toupper(symbols)]
+  features_use <- features_map[!is.na(features_map)]
+  
+  # Run FeaturePlot
+  p <- FeaturePlot(object, features = features_use, ...)
+  
+  # Patchwork output: relabel titles manually
+  for (i in seq_along(p)) {
+    feat <- features_use[i]
+    sym  <- ens_to_symbol[feat]
+    p[[i]] <- p[[i]] + ggtitle(sym)
+  }
+  return(p)
+}
+
+
+
+```
+
+
+
+
+```{r Myeloid Sanity Check}
+
+# Marker sets
+Lymph_markers_neg <- c("Cd3e","Cd4","Cd8a","Klrb1c")    
+Myeloid_markers   <- c("Itgam","Lyz2","Adgre1","Csf1r")
+
+# Macrophage subsets 
+Res_mphi   <- c("Timd4","Lyve1","Folr2","Mrc1")
+Ccr2_mphi  <- c("Ccr2","Cd52","Trem2","Apoe")
+MhcII_hi   <- c("Runx3","Cx3cr1","Mmp13","Il1b")
+
+# Monocytes & Neutrophils
+Monocyte   <- c("Ly6c2","Plac8","Ccr2","Cx3cr1")  
+Neutrophils<- c("Ly6g","S100a8","S100a9")
+
+# Dendritic subsets
+Cdc1 <- c("Xcr1","Cd8a","Clec9a","H2-ab1","Cd24a")
+Cdc2 <- c("Sirpa","Itgax","H2-ab1","Ptprc","Cd4")
+Pdc  <- c("Ptprc","Itgax","H2-ab1","Siglech")
+
+myeloid <- subset(seurat_atlas, subset = lineage_r.02 == "myeloid")
+DefaultAssay(myeloid) <- "SCT"
+
+FeaturePlotSymbols(myeloid,
+                   Myeloid_markers,
+                   mapping = gene_map,
+                   order = TRUE, raster = TRUE)
+
+
+
+```
+
+
+
+
+
+
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(plyr) 
+  library(cowplot)
+})
+
+# Resolution
+res <- 0.6
+
+# Ensure neighbors/graph exist, cluster if needed
+if (!"integrated_snn" %in% names(seurat_atlas@graphs)) {
+  DefaultAssay(seurat_atlas) <- "integrated"
+  seurat_atlas <- FindNeighbors(seurat_atlas, reduction = "pca", dims = 1:30)
+}
+seurat_atlas <- FindClusters(seurat_atlas, graph.name = "integrated_snn", resolution = res)
+
+# Metadata column name
+new_col <- paste0("integrated_snn_res.", res)
+Idents(seurat_atlas) <- new_col
+
+# Marker panels (symbols only)
+marker_panels <- list(
+  Mac_Resident   = c("Timd4","Lyve1","Folr2","Mrc1","Igf1","F13a1","Cd163"),
+  Mac_CCR2       = c("Ccr2","Trem2","Apoe","Cd14","H2-Ab1"),
+  Mac_MHCIIhi    = c("Runx3","Cx3cr1","Il1b","Maf","Klf2","H2-Aa","Cd74"),
+  Monocyte       = c("Ly6c2","Csf1r","Itgam"),
+  DC_cDC1        = c("Xcr1","Clec9a","Itgax","H2-Ab1","Cd74"),
+  DC_cDC2        = c("Sirpa","Itgax","Cd4","H2-Ab1"),
+  pDC            = c("Siglech","Irf7"),
+  T_CD4          = c("Cd3e","Cd4"),
+  T_CD8          = c("Cd3e","Cd8a"),
+  T_Treg         = c("Cd3e","Cd4","Foxp3"),
+  Bcell          = c("Cd79a","Ms4a1","Cd19"),
+  NK             = c("Ncr1","Klrb1c","Gzmb"),
+  LEC            = c("Prox1","Lyve1","Flt4","Nrp2","Pdpn"),
+  Endo_arterial  = c("Id1","Mgll"),
+  Endo_venous    = c("Plvap","Vwf"),
+  Endo_general   = c("Pecam1","Cdh5","Kdr","Eng"),
+  Fibro_RCF      = c("Bcl11a","Sox4","Pdgfra"),
+  Fibro_Matr     = c("Atf3","Klf4","Klf2","Jun"),
+  Neut           = c("Ly6g","S100a8","S100a9"),
+  Eos            = c("Siglecf"),
+  Baso           = c("Fcer1a","Mcpt8")
+)
+
+# Collect all unique markers
+features_all <- unique(unlist(marker_panels))
+
+# Split into halves for readability
+n_feat <- length(features_all)
+split_idx <- ceiling(n_feat / 2)
+features_part1 <- features_all[seq_len(split_idx)]
+features_part2 <- if (split_idx < n_feat) features_all[(split_idx + 1):n_feat] else character(0)
+
+# ---- UMAP plots ----
+p_lineage <- DimPlot(seurat_atlas, reduction = "umap",
+                     group.by = "lineage_r.02", label = FALSE) +
+  ggtitle("Broad lineages (annotated) @ res 0.2")
+
+p_umap <- DimPlot(seurat_atlas, reduction = "umap",
+                  group.by = new_col, label = TRUE) +
+  ggtitle(paste0("UMAP @ res ", res))
+
+print(p_lineage)
+print(p_umap)
+
+# ---- DotPlots separately ----
+p_dot1 <- DotPlotSymbols(seurat_atlas,
+                         symbols = features_part1,
+                         mapping = gene_map,
+                         group.by = new_col) +
+  ggtitle(paste0("Markers (1/2) @ res ", res))
+print(p_dot1)
+
+if (length(features_part2) > 0) {
+  p_dot2 <- DotPlotSymbols(seurat_atlas,
+                           symbols = features_part2,
+                           mapping = gene_map,
+                           group.by = new_col) +
+    ggtitle(paste0("Markers (2/2) @ res ", res))
+  print(p_dot2)
+}
+
+
+```
+
+
+
+
+```{r Resolution 0.6 cluster mappings}
+
+res <- 0.6
+res0.6_col <- paste0("integrated_snn_res.", res)
+Idents(seurat_atlas) <- res0.6_col
+
+# Defining identities 
+map_06 <- c(
+  `4`  = "Mac_Resident/TLF+",
+  `6`  = "Mac_CCR2+",
+  `2`  = "Mac_MHCII^hi",
+  `9`  = "Monocyte",
+  `17` = "DCs",
+  `16` = "NKT",
+  `13` = "B cells",
+  `1`  = "Neutrophils",
+  # Endothelial clusters
+  `23` = "Endothelial",
+  `5`  = "Endothelial",
+  # Fibroblast clusters
+  `0`  = "Fibroblast",
+  `7`  = "Fibroblast",
+  `11` = "Fibroblast",
+  `15` = "Fibroblast",
+  `18` = "Fibroblast",
+  `21` = "Fibroblast"
+)
+
+# Store mapping in a new metadata column
+col_lab <- "lineage_r.06"
+
+# Convert cluster ids to character to index map safely
+cl_ids <- as.character(seurat_atlas[[res0.6_col]][,1])
+
+# Apply mapping; anything not listed becomes "Other"
+annot <- unname(map_06[cl_ids])
+annot[is.na(annot)] <- "Other"
+
+seurat_atlas[[col_lab]] <- factor(
+  annot,
+  levels = c(
+    "Mac_Resident/TLF+","Mac_CCR2+","Mac_MHCII^hi","Monocyte",
+    "DCs","NKT","B cells","Neutrophils","Endothelial","Fibroblast","Other"
+  )
+)
+
+
+```
+
+
+
+
+
+```{r Visualizing mappings at res 0.6}
+
+p_lineage <- DimPlot(seurat_atlas, reduction="umap", group.by = col_lab, label=TRUE) +
+  ggtitle("Broad lineages @ res 0.6")
+p_clusters <- DimPlot(seurat_atlas, reduction="umap", group.by = new_col, label=TRUE) +
+  ggtitle(paste0("UMAP @ res ", res))
+p_lineage
+p_clusters
+
+
+```
+
+
+
+
+```{r Res 0.8 - clustering round 2}
+
+# Higher resolution clustering
+res <- 0.8
+if (!"integrated_snn" %in% names(seurat_atlas@graphs)) {
+  DefaultAssay(seurat_atlas) <- "integrated"
+  seurat_atlas <- FindNeighbors(seurat_atlas, reduction = "pca", dims = 1:30)
+}
+seurat_atlas <- FindClusters(seurat_atlas, graph.name = "integrated_snn", resolution = res)
+new_col <- paste0("integrated_snn_res.", res)
+Idents(seurat_atlas) <- new_col
+
+# Marker panels
+marker_panels_2 <- list(
+  TLF_Mac= c("Timd4","Lyve1","Folr2","Ninj1","Gas6","Mrc1","Cd163","Igf1","Sepp1","Igfb4"),
+  MhcII_hi= c("Cd14","Cst3","Lilra5","Apoe","H3f3b","C5ar1","St3gal6"),
+  Ccr2_Mac= c("Ccr2","Cd52","H2-Eb1","H2-Ab1","Bcl2a1a","Coro1a","Cyp4f18","Fxdy5"),
+  Prolif_C1q_TLF_Macs= c("Birc5","Mki67","C1qa"),  
+  Spp1_Macs= c("Spp1","Trem2","Lipa"), 
+  C1q_TLF_Macs= c("C1qa","C1qb","Mrc1","Igf1"),
+  Gpnmb= c("Gpnmb","Fabp5","Ctsd","Syngr1")
+)
+
+features_all <- unique(unlist(marker_panels_2))
+DefaultAssay(seurat_atlas) <- "SCT"
+
+# UMAPs
+DimPlot(seurat_atlas, reduction="umap", group.by="lineage_r.06", label=FALSE) +
+  ggtitle("Broad lineages (annotated) @ res 0.8")
+
+p_umap <- DimPlot(seurat_atlas, reduction="umap", group.by=new_col, label=TRUE) +
+  ggtitle(paste0("UMAP @ res ", res))
+print(p_umap)
+
+# DotPlots (split for readability)
+n_feat <- length(features_all)
+split_idx <- ceiling(n_feat / 2)
+features_part1 <- features_all[seq_len(split_idx)]
+features_part2 <- if (split_idx < n_feat) features_all[(split_idx+1):n_feat] else character(0)
+
+p_dot1 <- DotPlotSymbols(seurat_atlas,
+                         symbols=features_part1,
+                         mapping=gene_map,
+                         group.by=new_col) +
+  ggtitle(paste0("Markers (1/2) @ res ", res))
+print(p_dot1)
+
+if (length(features_part2) > 0) {
+  p_dot2 <- DotPlotSymbols(seurat_atlas,
+                           symbols=features_part2,
+                           mapping=gene_map,
+                           group.by=new_col) +
+    ggtitle(paste0("Markers (2/2) @ res ", res))
+  print(p_dot2)
+}
+
+# Monocyte markers
+features_monocyte <- c("Ccr2","Ly6c2","Cx3cr1","Treml4","Plac8")
+DotPlotSymbols(seurat_atlas,
+               symbols=features_monocyte,
+               mapping=gene_map,
+               group.by=new_col) +
+  ggtitle("Ly6C^hi vs Ly6C^lo monocyte markers")
+
+
+
+```
+
+
+
+
+```{r Endo + Fibroblast annotation}
+
+# Higher resolution clustering
+res <- 0.8
+
+if (!"integrated_snn" %in% names(seurat_atlas@graphs)) {
+  DefaultAssay(seurat_atlas) <- "integrated"
+  seurat_atlas <- FindNeighbors(seurat_atlas, reduction = "pca", dims = 1:30)
+}
+seurat_atlas <- FindClusters(seurat_atlas, graph.name = "integrated_snn", resolution = res)
+
+# New metadata column
+new_col <- paste0("integrated_snn_res.", res)
+Idents(seurat_atlas) <- new_col
+
+# Marker panels
+marker_panels_3 <- list(
+  LECs             = c("Lyve1","Prox1","Flt4","Nrp2","Cd31","Pdpn","Reln"),
+  Immunomodulatory = c("Ptprc","Cdh5"),
+  Arterial_ECs     = c("Id1","Mgll"),
+  Venous_ECs       = c("Plvap","Vwf"),      
+  ECs              = c("Pecam1","Cdh5","Cd36","Fabp4","Eng","Esam","Tler1","Kdr"),
+  RCFs             = c("Cthrc1","Acta2","Fn1","Col1a1","Postn","Tagln"),
+  Matrifibrocytes  = c("Comp","Sfrp2","Cilp","Eln","Wisp2"), 
+  Ccl2_fibroblasts = c("Mt2","Ccl2","Timp1","Mt1","Prg4","Angptl4"),
+  Mki67_fibroblasts= c("Stmn1","H2afz","Cks2","Cenpa","Acta2","Hmgb2")
+)
+
+# Use SCT for visualization
+DefaultAssay(seurat_atlas) <- "SCT"
+
+# Load mapping (Ensembl <-> Symbol)
+gene_map <- read.csv("/projects/b1246/Isaac/gene_map_mouse.csv")
+
+# All marker features
+features_all <- unique(unlist(marker_panels_3))
+
+# Split into two halves for readability
+n_feat <- length(features_all)
+split_idx <- ceiling(n_feat / 2)
+features_part1 <- features_all[seq_len(split_idx)]
+features_part2 <- if (split_idx < n_feat) features_all[(split_idx + 1):n_feat] else character(0)
+
+# Visualize broad lineages
+DimPlot(seurat_atlas, reduction="umap", group.by="lineage_r.06", label=FALSE) +
+  ggtitle("Broad lineages (annotated) @ res 0.8")
+
+# UMAP of new clusters
+p_umap <- DimPlot(seurat_atlas, reduction = "umap", group.by = new_col, label = TRUE) +
+  ggtitle(paste0("UMAP @ res ", res))
+print(p_umap)
+
+# DotPlots with SYMBOLs (via helper)
+p_dot1 <- DotPlotSymbols(
+  seurat_atlas,
+  symbols = features_part1,
+  mapping = gene_map,
+  group.by = new_col
+) + RotatedAxis() + ggtitle(paste0("Markers (1/2) @ res ", res))
+print(p_dot1)
+
+if (length(features_part2) > 0) {
+  p_dot2 <- DotPlotSymbols(
+    seurat_atlas,
+    symbols = features_part2,
+    mapping = gene_map,
+    group.by = new_col
+  ) + RotatedAxis() + ggtitle(paste0("Markers (2/2) @ res ", res))
+  print(p_dot2)
+}
+
+
+
+```
+
+
+```{r}
+## --- Setup
+res <- 0.8
+res_col <- paste0("integrated_snn_res.", res)
+Idents(seurat_atlas) <- res_col
+col_lab <- "lineage_r.08"
+
+## --- Mapping (cluster renames and merges)
+map_08 <- c(
+  `2`  = "MHCII Mac",
+  `3`  = "CCR2+ Mac",           # renamed SPP1+
+  `7`  = "TLF Mac",             # GPNMB+ under TLF
+  `14` = "TLF Mac",             # C1q+ under TLF
+  `9`  = "Ly6C-hi Mono",
+  `22` = "Ly6C-lo Mono",
+  `12` = "B Cells",
+  `17` = "ARG1+ Mac",
+  `24` = "Prolif TLF Mac",
+  `19` = "NKT",
+  `20` = "DCs",
+  `1`  = "Neutrophils",
+  `26` = "Arterial ECs",
+  `21` = "Venous ECs",
+  `5`  = "ECs",
+  `6`  = "RCFs",
+  `4`  = "RCFs"
+)
+
+cl_ids <- Idents(seurat_atlas)
+annot  <- map_08[as.character(cl_ids)]
+annot[is.na(annot)] <- "Other"
+seurat_atlas@meta.data[[col_lab]] <- annot
+
+## --- Ordered levels (collapsed categories)
+lvl_order <- c(
+  "Ly6C-hi Mono","Ly6C-lo Mono","Neutrophils","DCs",
+  "MHCII Mac","CCR2+ Mac","TLF Mac","ARG1+ Mac","Prolif TLF Mac",
+  "B Cells","NKT",
+  "Arterial ECs","Venous ECs","ECs","RCFs","Other"
+)
+vals <- seurat_atlas@meta.data[[col_lab]]
+seurat_atlas@meta.data[[col_lab]] <- factor(vals, levels = intersect(lvl_order, unique(vals)))
+
+## --- Updated color palette (collapsed to match new labels)
+pal_hc <- c(
+  "Ly6C-hi Mono"   = "#D55E00",   # vermillion
+  "Ly6C-lo Mono"   = "#E69F00",   # orange
+  "Neutrophils"    = "#0072B2",   # blue
+  "DCs"            = "#56B4E9",   # sky blue
+  "MHCII Mac"      = "#009E73",   # green
+  "CCR2+ Mac"      = "#851033",   # renamed
+  "TLF Mac"        = "#2C7FB8",   # merged Gpnmb + C1q+
+  "ARG1+ Mac"      = "#33A02C",   # green 2
+  "Prolif TLF Mac" = "#A6D854",   # light green
+  "B Cells"        = "#8C564B",   # brown
+  "NKT"            = "#CC79A7",   # purple-pink
+  "Arterial ECs"   = "#FB9A99",   # salmon
+  "Venous ECs"     = "#B15928",   # sienna
+  "ECs"            = "#6A3D9A",   # purple
+  "RCFs"           = "#F0E442",   # yellow
+  "Other"          = "#BDBDBD"    # grey
+)
+pal_plot <- pal_hc[levels(seurat_atlas@meta.data[[col_lab]])]
+
+## --- Save metadata
+seurat_atlas[[col_lab]] <- NULL  
+seurat_atlas <- Seurat::AddMetaData(
+  seurat_atlas,
+  metadata = setNames(
+    data.frame(
+      lineage = factor(
+        annot,
+        levels = lvl_order
+      ),
+      row.names = colnames(seurat_atlas)
+    ),
+    col_lab
+  )
+)
+
+Seurat::Idents(seurat_atlas) <- col_lab
+
+if (is.null(seurat_atlas@misc)) seurat_atlas@misc <- list()
+seurat_atlas@misc$annotation_maps <- modifyList(
+  seurat_atlas@misc$annotation_maps %||% list(),
+  list("r0.8" = map_08)
+)
+seurat_atlas@misc$palettes <- modifyList(
+  seurat_atlas@misc$palettes %||% list(),
+  list("lineage_r.08" = pal_hc)
+)
+
+## --- Plot
+p <- DimPlot(
+  seurat_atlas,
+  reduction = "umap",
+  group.by  = col_lab,
+  label     = TRUE,
+  repel     = TRUE,
+  label.size= 4.2,
+  pt.size   = 0.25,
+  shuffle   = TRUE
+) +
+  ggtitle("UMAP — annotated (r = 0.8)") +
+  scale_color_manual(values = pal_plot) +
+  guides(color = guide_legend(override.aes = list(size = 4))) +
+  theme(
+    legend.title = element_blank(),
+    legend.text  = element_text(size = 9),
+    plot.title   = element_text(size = 18, face = "bold")
+  )
+print(p)
+
+
+```
+
+
+
+```{r AddModuleScore helper function }
+
+AddModuleScoreSymbols <- function(object, symbols, mapping, name, assay = "SCT", ...) {
+  # SYMBOL -> ENSEMBL lookup
+  symbol_to_ens <- setNames(mapping$ensembl_gene_id, toupper(mapping$mgi_symbol))
+  
+  # Map symbols to Ensembl IDs
+  features_ens <- symbol_to_ens[toupper(symbols)]
+  features_ens <- features_ens[!is.na(features_ens)]
+  
+  # Keep only features that exist in the assay
+  present <- rownames(GetAssayData(object[[assay]], layer = "data"))
+  features_ens <- intersect(features_ens, present)
+  
+  if (length(features_ens) < 2) {
+    stop("Not enough mapped features present in assay for module scoring")
+  }
+  
+  AddModuleScore(object, features = list(features_ens), name = name, assay = assay, ...)
+}
+
+
+
+
+```
+
+
+
+
+```{r Filtering Apoptotic Cells }
+
+res <- 0.8
+res_col <- paste0("integrated_snn_res.", res)
+Idents(seurat_atlas) <- res_col
+
+# Defining apoptotic cell markers
+
+apoptotic_markers <- c(
+  "Bax","Bak1","Bbc3","Bcl2l11",   
+  "Casp3","Casp8","Casp9",         
+  "Ddit3","Atf4","Atf3",           
+  "Hspa1a","Hspa1b","Jun","Fos"   
+)
+
+#Dotplot
+p_apop <- DotPlotSymbols(
+  seurat_atlas,
+  symbols  = apoptotic_markers,
+  mapping  = gene_map,
+  group.by = res_col
+) + RotatedAxis() + ggtitle("Apoptotic marker expression (res 0.8)")
+print(p_apop)
+
+#FeaturePlot
+
+FeaturePlotSymbols(
+  seurat_atlas,
+  symbols  = c("Bax","Casp3","Ddit3"),
+  mapping  = gene_map,
+  reduction= "umap",
+  order    = TRUE,
+  raster   = TRUE
+)
+
+
+
+# Run module scoring with SYMBOLs directly
+seurat_atlas <- AddModuleScoreSymbols(
+  seurat_atlas,
+  symbols  = apoptotic_markers,
+  mapping  = gene_map,
+  name     = "ApoptosisScores",
+  assay    = "SCT"
+)
+
+
+
+VlnPlot(seurat_atlas,
+        features = "ApoptosisScores1",
+        group.by = res_col,
+        pt.size = 0) +
+  ggtitle("Apoptosis module score per cluster (res 0.8)")
+
+
+
+
+```
+
+
+
+```{r ReAnnotating Fibroblasts Clusters}
+
+#Fibroblast markers
+
+fibro_panels <- list(
+  RCFs             = c("Cthrc1","Acta2","Fn1","Col1a1","Postn","Tagln"),
+  Matrifibrocytes  = c("Comp","Sfrp2","Cilp","Eln","Wisp2"), 
+  Ccl2_fibroblasts = c("Mt2","Ccl2","Timp1","Mt1","Prg4","Angptl4"),
+  Mki67_fibroblasts= c("Stmn1","H2afz","Cks2","Cenpa","Acta2","Hmgb2")
+)
+
+#AddModuleScore
+for (nm in names(fibro_panels)) {
+  seurat_atlas <- AddModuleScoreSymbols(
+    seurat_atlas,
+    symbols  = fibro_panels[[nm]],
+    mapping  = gene_map,
+    name     = paste0("Fib_", nm),
+    assay    = "SCT"
+  )
+}
+
+#Violin Plots
+fibro_features <- c("Fib_RCFs1","Fib_Matrifibrocytes1",
+                    "Fib_Ccl2_fibroblasts1","Fib_Mki67_fibroblasts1")
+
+for (feat in fibro_features) {
+  print(
+    VlnPlot(seurat_atlas,
+            features = feat,
+            group.by = res_col,
+            pt.size  = 0) +
+      ggtitle(paste0("Fibroblast program: ", feat))
+  )
+}
+
+# FeaturePlots 
+FeaturePlot(seurat_atlas,
+            features = c("Fib_RCFs1","Fib_Matrifibrocytes1"),
+            order    = TRUE, raster = TRUE) + 
+  ggtitle("Fibroblast subsets: RCFs & Matrifibrocytes")
+
+FeaturePlot(seurat_atlas,
+            features = c("Fib_Ccl2_fibroblasts1","Fib_Mki67_fibroblasts1"),
+            order    = TRUE, raster = TRUE) + 
+  ggtitle("Fibroblast subsets: Ccl2+ & Mki67+")
+
+
+
+```
+
+
+
+
+```{r Differential expression cluster 11,8,23}
+
+# Make sure SCT assay is active
+DefaultAssay(seurat_atlas) <- "SCT"
+
+# Prepare SCT models for differential expression
+seurat_atlas <- PrepSCTFindMarkers(seurat_atlas)
+
+# Now rerun FindMarkers
+markers_11 <- FindMarkers(seurat_atlas, ident.1 = 11, min.pct = 0.25, logfc.threshold = 0.25)
+markers_23 <- FindMarkers(seurat_atlas, ident.1 = 23, min.pct = 0.25, logfc.threshold = 0.25)
+markers_8  <- FindMarkers(seurat_atlas, ident.1 = 8,  min.pct = 0.25, logfc.threshold = 0.25)
+
+
+annotate_markers <- function(markers_df, gene_map) {
+  markers_df$ensembl_gene_id <- rownames(markers_df)
+  out <- merge(markers_df, gene_map, by = "ensembl_gene_id", all.x = TRUE)
+  colnames(out)[colnames(out) == "mgi_symbol"] <- "gene_symbol"  # standardize name
+  return(out)
+}
+
+
+markers_11_annot <- annotate_markers(markers_11, gene_map)
+markers_23_annot <- annotate_markers(markers_23, gene_map)
+markers_8_annot  <- annotate_markers(markers_8,  gene_map)
+
+# Preview results
+head(markers_11_annot[, c("gene_symbol", "avg_log2FC", "p_val_adj")])
+head(markers_23_annot[, c("gene_symbol", "avg_log2FC", "p_val_adj")])
+head(markers_8_annot[,  c("gene_symbol", "avg_log2FC", "p_val_adj")])
+
+
+```
+
+
+
+
+
+```{r FeaturePlot visualization}
+
+Idents(seurat_atlas) <- "RNA_snn_res.0.8"
+
+FeaturePlot(seurat_atlas, features = c("Acta2", "S100a4", "Fap"),
+            label = TRUE)
+
+VlnPlot(seurat_atlas,
+        features = c("Acta2", "S100a4", "Fap"),
+        group.by = "seurat_clusters", pt.size = 0)
+
+
+FeaturePlot(seurat_atlas, features = c("Cd68", "Mrc1"),
+            label = TRUE)
+
+
+
+p_umap <- DimPlot(seurat_atlas, reduction="umap", group.by=new_col, label=TRUE) +
+  ggtitle(paste0("UMAP @ res ", res))
+print(p_umap)
+
+```
+
+
+
+
+
+```{r further investigation of cluster 11,23,8}
+
+# Myofibroblast activation panel
+FeaturePlot(seurat_atlas, features = c("S100a4", "Fap", "Postn"), label = TRUE)
+
+# VSMC panel
+FeaturePlot(seurat_atlas, features = c("Tagln", "Myh11", "Cnn1", "Pdgfrb"), label = TRUE)
+
+# Macrophage panel
+FeaturePlot(seurat_atlas, features = c("Cd68", "Mrc1"), label = TRUE)
+
+
+
+```
+
+
+
+
+
+```{r Cluster 8 refinement}
+
+VlnPlot(seurat_atlas, features = c("nCount_RNA","nFeature_RNA","percent.mt"), group.by = "seurat_clusters")
+
+
+```
+
+
+
+
+
+
+```{r Reannotation of UMAP}
+
+## make sure identities match resolution 0.8 clustering
+res <- 0.8
+res_col <- paste0("integrated_snn_res.", res)
+Idents(seurat_atlas) <- res_col
+
+map_08 <- c(
+  # Macs & monos 
+  `2`  = "MHCII Mac",
+  `3`  = "CCR2+ Mac",           
+  `7`  = "TLF Mac",             
+  `14` = "TLF Mac",             
+  `9`  = "Ly6C-hi Mono",
+  `22` = "Ly6C-lo Mono",
+  `12` = "B Cells",
+  `17` = "ARG1+ Mac",
+  `24` = "Prolif TLF Mac",     
+  `19` = "NKT",
+  `20` = "DCs",
+  `1`  = "Neutrophils",
+  
+  # Endothelial 
+  `26` = "Arterial ECs",        
+  `21` = "Venous ECs",
+  `5`  = "ECs",
+  
+  # Fibroblast lineage
+  `16` = "Fibroblast progenitors",    
+  `0`  = "Matrifibrocytes",
+  `15` = "Ccl2 fibroblasts",
+  `13` = "Ccl2 fibroblasts",
+  `4`  = "Transitional fibroblasts", 
+  `6`  = "VSMCs",                
+  `10` = "RCFs",                      
+  `25` = "Prolif RCFs",              
+  
+  # Stromal branches
+  `11` = "Transitional MMT",     
+  `8`  = "Cardiomyocytes",
+  `23` = "Fibroblasts"          
+)
+
+## Apply mapping
+col_lab <- "lineage_r.08"
+cl_ids  <- Idents(seurat_atlas)
+annot   <- map_08[as.character(cl_ids)]
+annot[is.na(annot)] <- "Unassigned stromal"
+seurat_atlas@meta.data[[col_lab]] <- annot
+
+## Ordered levels
+lvl_order <- c(
+  # monos/macrophages
+  "Ly6C-hi Mono","Ly6C-lo Mono","Neutrophils","DCs",
+  "MHCII Mac","CCR2+ Mac","TLF Mac","ARG1+ Mac","Prolif TLF Mac",
+  "B Cells","NKT",
+  # endothelium
+  "Arterial ECs","Venous ECs","ECs",
+  # fibroblast programs
+  "Fibroblast progenitors",
+  "RCFs","Transitional fibroblasts","Prolif RCFs",
+  "Matrifibrocytes",
+  "Ccl2 fibroblasts",
+  # stromal
+  "Transitional MMT","Fibroblasts","VSMCs",
+  "Cardiomyocytes",
+  "Unassigned"
+)
+vals <- seurat_atlas@meta.data[[col_lab]]
+seurat_atlas@meta.data[[col_lab]] <- factor(vals, levels = intersect(lvl_order, unique(vals)))
+
+## Palette
+pal_hc <- c(
+  # monos/macrophages
+  "Ly6C-hi Mono"   = "#D55E00",
+  "Ly6C-lo Mono"   = "#E69F00",
+  "Neutrophils"    = "#0072B2",
+  "DCs"            = "#56B4E9",
+  "MHCII Mac"      = "#009E73",
+  "CCR2+ Mac"      = "#851033",
+  "TLF Mac"        = "#2C7FB8",
+  "ARG1+ Mac"      = "#33A02C",
+  "Prolif TLF Mac" = "#A6D854",
+  "B Cells"        = "#8C564B",
+  "NKT"            = "#CC79A7",
+  # endothelium
+  "Arterial ECs"   = "#FB9A99",
+  "Venous ECs"     = "#B15928",
+  "ECs"            = "#6A3D9A",
+  # fibroblasts
+  "Fibroblast progenitors" = "#D13F21",
+  "RCFs"                   = "#F0E442",
+  "Transitional fibroblasts" = "#FFD700",
+  "Prolif RCFs"            = "#FFB347",
+  "Matrifibrocytes"        = "#FF7F00",
+  "Ccl2 fibroblasts"       = "#800080",
+  # stromal refinements
+  "Transitional MMT"       = "#20B2AA",   # teal
+  "Fibroblasts"            = "#A0522D",   # brown
+  "VSMCs"                  = "#6421D1",   # deep violet
+  "Cardiomyocytes"= "#7A9134"
+)
+
+pal_plot <- pal_hc[levels(seurat_atlas@meta.data[[col_lab]])]
+
+p <- DimPlot(
+  seurat_atlas,
+  reduction = "umap",         
+  group.by  = col_lab,
+  label     = TRUE,
+  repel     = TRUE,
+  label.size= 4,
+  pt.size   = 0.25,
+  shuffle   = TRUE
+) +
+  ggtitle("UMAP — annotated (r = 0.8)") +
+  scale_color_manual(values = pal_plot) +
+  guides(color = guide_legend(override.aes = list(size = 4))) +
+  theme(
+    legend.title = element_blank(),
+    legend.text  = element_text(size = 9),
+    plot.title   = element_text(size = 18, face = "bold")
+  )
+
+print(p)
+
+
+```
+
+
+
+
+```{r}
+
+## --- Macrophage/monocyte identities (match annotation above)
+mac_ids <- c("Ly6C-hi Mono","Ly6C-lo Mono",
+             "MHCII Mac","CCR2+ Mac","TLF Mac",
+             "ARG1+ Mac","Prolif TLF Mac")
+
+## --- Extract cells belonging to macrophage/monocyte groups
+mac_cells <- rownames(
+  seurat_atlas@meta.data[
+    seurat_atlas@meta.data[[col_lab]] %in% mac_ids, ]
+)
+
+## --- Subset object directly by those cells
+mac_obj <- subset(seurat_atlas, cells = mac_cells)
+
+## --- Clean factor levels
+mac_obj[[col_lab]] <- droplevels(mac_obj[[col_lab]])
+
+## --- Macrophage palette
+pal_mac <- pal_hc[mac_ids]
+
+## --- Plot macrophage-only UMAP
+p_mac <- DimPlot(
+  mac_obj,
+  reduction = "umap",
+  group.by  = col_lab,
+  label     = TRUE,
+  repel     = TRUE,
+  label.size= 4,
+  pt.size   = 0.3,
+  shuffle   = TRUE
+) +
+  ggtitle("UMAP — macrophage & monocyte subsets (r = 0.8)") +
+  scale_color_manual(values = pal_mac) +
+  guides(color = guide_legend(override.aes = list(size = 4))) +
+  theme(
+    legend.title = element_blank(),
+    legend.text  = element_text(size = 9),
+    plot.title   = element_text(size = 16, face = "bold")
+  )
+
+print(p_mac)
+
+
+
+```
+
+
+
+####SAVING OBJECT######
+```{r}
+saveRDS(seurat_atlas, "/projects/b1246/Isaac/seurat_atlas.rds")
+
+```
+
+
+###########################################
+
+# CREATING THE SINGLE R COMPATIBLE OBJECT
+
+###########################################
+
+```{r SINGLE R ATLAS CREATION}
+
+## --- Setup
+Atlas <- seurat_atlas
+DefaultAssay(Atlas) <- "RNA"
+
+## --- Extract raw counts from Seurat v5 Assay5
+expr_counts <- Atlas[["RNA"]]$counts
+
+## --- Ensure unique gene names
+expr_counts <- expr_counts[!duplicated(rownames(expr_counts)), , drop = FALSE]
+
+## --- Align labels with counts
+cells_counts <- colnames(expr_counts)              # cells in counts
+cells_meta   <- rownames(Atlas@meta.data)          # cells in metadata
+
+# Subset metadata to same cells and order
+labels <- as.character(Atlas@meta.data[cells_counts, "lineage_r.08"])
+
+## --- Keep only valid cells
+keep <- !is.na(labels) & labels != ""
+expr_counts <- expr_counts[, keep, drop = FALSE]
+labels <- labels[keep]
+
+## --- Build SingleCellExperiment
+library(SingleCellExperiment)
+sce_reference <- SingleCellExperiment(assays = list(counts = expr_counts))
+colData(sce_reference)$label <- labels
+
+## --- Filter: keep labels with >=20 cells
+cell_counts <- table(labels)
+good_labels <- names(cell_counts[cell_counts >= 20])
+sce_reference <- sce_reference[, labels %in% good_labels]
+labels <- colData(sce_reference)$label
+
+## --- Aggregate to pseudobulk by label
+library(scuttle)
+sce_reference_pb <- aggregateAcrossCells(
+  sce_reference,
+  ids = labels
+)
+
+## --- Normalize (adds logcounts)
+library(scater)
+sce_reference_pb <- logNormCounts(sce_reference_pb)
+
+## --- Sanity checks
+dim(sce_reference_pb)              # genes × pseudobulk samples
+colnames(sce_reference_pb)         # pseudobulk labels kept
+assayNames(sce_reference_pb)       # "counts", "logcounts"
+table(labels)                      # cell counts per label (post-filter)
+
+## --- Barplot (after filtering)
+barplot(table(labels), las = 2, cex.names = 0.7,
+        main = "Cells per pseudobulk label (≥20 filter)", col = "steelblue")
+
+
+
+```
+
+#Saving reference
+
+```{r}
+saveRDS(sce_reference_pb,
+        file = "/scratch/inm3056/atlas_reference.rds")
+```
+
+
+
+
+#############################################
+ANNOTATING MERTK ADULT SAMPLES
+ANNOTATING MERTK ADULT SAMPLES 
+ANNOTATING MERTK ADULT SAMPLES 
+#############################################
+
+
+
+Annotating the MERTK adult conditions using the cardiac reference atlas
+```{r Seurat Harmony --> Annotate with Atlas}
+
+## --- Subset to Adult
+MERTK_adult <- subset(seurat_harmony, subset = age_group == "Adult")
+
+## --- Dependencies
+library(SingleCellExperiment)
+library(Matrix)
+library(SingleR)
+
+## --- 1) Extract KO + WT cell identities
+cells_KO <- colnames(MERTK_adult)[MERTK_adult$genotype == "KO"]
+cells_WT <- colnames(MERTK_adult)[MERTK_adult$genotype == "WT"]
+
+## --- 2) Extract KO + WT matrices from layers
+gene_names <- rownames(MERTK_adult[["RNA"]])
+counts_KO  <- MERTK_adult[["RNA"]]@layers[["counts.KO_Adult"]]
+counts_WT  <- MERTK_adult[["RNA"]]@layers[["counts.WT_Adult"]]
+
+# Attach gene names and matching cell barcodes
+rownames(counts_KO) <- gene_names
+rownames(counts_WT) <- gene_names
+colnames(counts_KO) <- cells_KO
+colnames(counts_WT) <- cells_WT
+
+# Combine
+expr_counts <- cbind(counts_KO, counts_WT)
+expr_counts <- expr_counts[!duplicated(rownames(expr_counts)), , drop = FALSE]
+cat("Counts matrix:", nrow(expr_counts), "genes ×", ncol(expr_counts), "cells\n")
+
+## --- 3) Align with metadata
+# Metadata already uses cell barcodes like "AAACCTGAGACTTTCG-1"
+common <- intersect(colnames(expr_counts), rownames(MERTK_adult@meta.data))
+length(common)
+
+# Subset and ensure order
+expr_counts <- expr_counts[, common, drop = FALSE]
+labels_meta <- MERTK_adult@meta.data[common, , drop = FALSE]
+expr_counts <- as(expr_counts, "dgCMatrix")
+stopifnot(all(colnames(expr_counts) == rownames(labels_meta)))
+
+## --- 4) Build SingleCellExperiment
+MERTK_adult_sce <- SingleCellExperiment(
+  assays  = list(counts = expr_counts),
+  colData = labels_meta
+)
+cat("Built SCE with:", nrow(MERTK_adult_sce), "genes ×", ncol(MERTK_adult_sce), "cells\n")
+
+
+## --- 5) Harmonize gene identifiers
+gene_map <- gene_map_mouse
+gene_map <- gene_map[!duplicated(gene_map$ensembl_gene_id), ]
+
+convert_ids <- function(ids) {
+  mapped <- gene_map$mgi_symbol[match(ids, gene_map$ensembl_gene_id)]
+  mapped[is.na(mapped)] <- ids[is.na(mapped)]
+  mapped
+}
+
+rownames(atlas_reference) <- convert_ids(rownames(atlas_reference))
+rownames(MERTK_adult_sce) <- convert_ids(rownames(MERTK_adult_sce))
+
+atlas_reference <- atlas_reference[!duplicated(rownames(atlas_reference)) & !is.na(rownames(atlas_reference)), ]
+MERTK_adult_sce <- MERTK_adult_sce[!duplicated(rownames(MERTK_adult_sce)) & !is.na(rownames(MERTK_adult_sce)), ]
+
+## --- 6) Check overlap
+common_genes <- intersect(rownames(MERTK_adult_sce), rownames(atlas_reference))
+cat("Overlapping genes:", length(common_genes), "\n")
+
+## --- 7) Restrict to common genes
+MERTK_adult_sce <- MERTK_adult_sce[common_genes, ]
+atlas_reference <- atlas_reference[common_genes, ]
+
+#Adding logcounts
+library(scuttle)
+MERTK_adult_sce <- logNormCounts(MERTK_adult_sce)
+
+
+## --- 8) Run SingleR
+pred_MERTK_adult <- SingleR(
+  test   = MERTK_adult_sce,
+  ref    = atlas_reference,
+  labels = colnames(atlas_reference)
+)
+
+## --- 9) Add SingleR labels back into Seurat object
+MERTK_adult$SingleR_label <- NA
+MERTK_adult$SingleR_label[common] <- pred_MERTK_adult$labels
+
+## --- 10) Visualize
+library(Seurat)
+library(ggplot2)
+
+p <- DimPlot(
+  MERTK_adult,
+  reduction = "umap",
+  group.by  = "SingleR_label",
+  label     = TRUE,
+  repel     = TRUE,
+  label.size = 5,
+  pt.size   = 0.5
+) +
+  ggtitle("Atlas Reference Annotation — Adult Only") +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title      = element_text(size = 22, face = "bold", hjust = 0.5),
+    legend.position = "right",
+    legend.text     = element_text(size = 14),
+    legend.title    = element_blank(),
+    axis.title      = element_text(size = 16),
+    axis.text       = element_text(size = 12)
+  )
+
+p_atlas_umap <- p
+
+print(p_atlas_umap)
+```
+
+
+
+
+```{r}
+saveRDS(MERTK_adult,
+        file = "/projects/b1246/Isaac/Mertk_adult.rds")
+```
+
+
+
+
+```{r}
+ggsave(
+  filename = "MERTK_Adult_AtlasAnnotation_UMAP.pdf",
+  path = "/projects/p31275/Isaac/MERTK/Figures",
+  width = 14, height = 8, dpi = 300
+)
+```
+
+
+
+
+Annotating the Adult samples (KO and WT) with Immgen
+```{r Seurat Harmony --> Annotate with ImmGen}
+
+library(scuttle)
+MERTK_adult_sce <- logNormCounts(MERTK_adult_sce)
+
+library(celldex)
+immgen_ref <- celldex::ImmGenData()
+immgen_ref
+
+common_genes <- intersect(rownames(MERTK_adult_sce), rownames(immgen_ref))
+length(common_genes)
+
+##Restricting both datasets to shared genes
+MERTK_adult_sce <- MERTK_adult_sce[common_genes, ]
+immgen_ref <- immgen_ref[common_genes, ]
+
+##Run SingleR using ImmGen reference
+pred_immgen <- SingleR(
+  test = MERTK_adult_sce,
+  ref = immgen_ref,
+  labels = immgen_ref$label.main,     
+  assay.type.test = "logcounts",      
+  assay.type.ref = "logcounts"        
+)
+
+##Inspect results
+table(pred_immgen$labels)
+
+##Add results back to Seurat object
+MERTK_adult$ImmGen_label <- pred_immgen$labels
+
+##Visualization
+library(ggplot2)
+DimPlot(
+  MERTK_adult,
+  reduction = "umap",
+  group.by = "ImmGen_label",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 4,
+  pt.size = 0.4
+) +
+  ggtitle("ImmGen Reference Annotation — Adult Only") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.text = element_text(size = 12),
+    legend.title = element_blank()
+  )
+
+##Save results
+ggsave(
+  filename = "MERTK_Adult_ImmGenAnnotation_UMAP.pdf",
+  path = "/projects/b1246/Isaac/MERTK/Figures",
+  width = 14, height = 8, dpi = 300
+)
+
+
+
+```
+
+
+```{r}
+saveRDS(MERTK_adult,
+        file = "/projects/b1246/Isaac/Mertk_adult.rds")
+```
+
+
+
+```{r}
+saveRDS(MERTK_adult_sce,
+        file = "/scratch/inm3056/mertk_adult_sce.rds")
+```
+
+
+
+
+
+
+
+
+
+
+
+##########################
+ATLAS VS IMMGEN REFERENCE
+#########################
+
+
+
+```{r ATLAS vs IMMGEN Reference Annotation}
+
+library(dplyr)
+library(pheatmap)
+
+## --- Filter cells with valid ImmGen annotations
+valid <- !(is.na(MERTK_adult$ImmGen_label) | MERTK_adult$ImmGen_label == "")
+pred_immgenMERTK_adult_filtered <- subset(MERTK_adult, cells = colnames(MERTK_adult)[valid])
+
+## --- Step 1: Mapping dictionaries
+atlas_to_immgen <- list(
+  "Macrophages"      = c("CCR2+ Mac","ARG1+ Mac","MHCII Mac","TLF Mac"),
+  "Monocytes"        = c("Ly6C-hi Mono","Ly6C-lo Mono"),
+  "Neutrophils"      = c("Neutrophils"),
+  "Fibroblasts"      = c("RCFs","Transitional fibroblasts","Matrifibrocytes",
+                         "Ccl2 fibroblasts","Fibroblasts","Fibroblast progenitors"),
+  "Endothelial cells"= c("ECs","Venous ECs"),
+  "Lymphoid"         = c("B Cells","T Cells","NKT","DCs"),
+  "Stromal cells"    = c("VSMCs","Transitional MMT","Stromal (perivascular?)"),
+  "Cardiomyocytes"   = c("Cardiomyocytes")
+)
+
+## Mapping each label to its ImmGen equivalent
+map_label <- function(x, map) {
+  for (key in names(map)) {
+    if (x %in% map[[key]]) return(key)
+  }
+  return("Other")
+}
+
+atlas_broad  <- sapply(MERTK_adult_filtered$SingleR_label, map_label, map = atlas_to_immgen)
+
+## --- Step 3: Normalize ImmGen labels to same naming scheme
+immgen_broad <- MERTK_adult_filtered$ImmGen_label
+immgen_broad[grepl("B cell", immgen_broad, ignore.case = TRUE)] <- "Lymphoid"
+immgen_broad[grepl("T cell|NK|NKT|DC|ILC|Tgd", immgen_broad, ignore.case = TRUE)] <- "Lymphoid"
+immgen_broad[grepl("Macroph", immgen_broad, ignore.case = TRUE)] <- "Macrophages"
+immgen_broad[grepl("Monocyte", immgen_broad, ignore.case = TRUE)] <- "Monocytes"
+immgen_broad[grepl("Neutroph", immgen_broad, ignore.case = TRUE)] <- "Neutrophils"
+immgen_broad[grepl("Fibro", immgen_broad, ignore.case = TRUE)] <- "Fibroblasts"
+immgen_broad[grepl("Endoth", immgen_broad, ignore.case = TRUE)] <- "Endothelial cells"
+immgen_broad[grepl("Strom", immgen_broad, ignore.case = TRUE)] <- "Stromal cells"
+immgen_broad[grepl("Cardio|Myo", immgen_broad, ignore.case = TRUE)] <- "Cardiomyocytes"
+
+##Confusion matrix
+mat <- prop.table(table(Atlas = atlas_broad, ImmGen = immgen_broad), 1)
+
+## Reordering the matrix
+mat <- mat[rowSums(mat) > 0, colSums(mat) > 0, drop = FALSE]
+order <- c("Macrophages","Monocytes","Neutrophils","Fibroblasts",
+           "Endothelial cells","Stromal cells","Lymphoid","Cardiomyocytes")
+mat <- mat[intersect(order, rownames(mat)), intersect(order, colnames(mat)), drop = FALSE]
+
+
+
+##HEATMAP COMPARISON
+
+
+
+pheatmap(
+  mat,
+  color = colorRampPalette(c("white","firebrick3"))(100),
+  main = "Broad Lineage Agreement — Atlas vs. ImmGen",
+  display_numbers = TRUE,
+  cluster_rows = FALSE, cluster_cols = FALSE,
+  fontsize = 12, angle_col = 45
+)
+
+
+
+summary_df <- as.data.frame(mat) %>%
+  group_by(Atlas) %>%
+  summarize(
+    TopMatch  = ImmGen[which.max(Freq)],
+    Agreement = round(max(Freq) * 100, 1)
+  ) %>%
+  arrange(desc(Agreement))
+print(summary_df)
+
+
+```
+
+
+
+###### IMMGEN vs ATLAS ANNOTATION DISCORDANCE ######
+
+
+A/ Sensitivity, precision, F1 score 
+```{r ImmGen Atlas Discordance}
+
+# Precision per atlas cell type
+calculate_precision <- function(cell_type) {
+  
+  immgen_calls_mac <- sum(MERTK_adult_filtered$ImmGen_label=="Macrophages")
+  
+  #Identifying how many cells are actually this cell type
+  atlas_is_type <- MERTK_adult_filtered$SingleR_label == cell_type
+  true_positives <- sum(immgen_calls_mac & atlas_is_type)
+  precision <- true_positives/ immgen_calls_mac
+  return(precision)
+}
+#Creating Validation metrics table
+validation_metrics <- data.frame(
+  Cell_Type = c("CCR2+ Mac", "ARG1+ Mac", "MHCII Mac", "TLF Mac", "Ly6c-hi Mono", "Ly6C-lo Mono", "B Cells", "VSMCs"),
+  Sensitivity= NA,
+  Precision = NA,
+  F1_Score = NA
+)
+#Filling in the metrics
+for (i in 1:nrow(validation_metrics)) {
+  cell_type <- validation_metrics$Cell_Type[i]
+  atlas_cells <- MERTK_adult_filtered$SingleR_label == cell_type
+  
+  if (grepl("Mac", cell_type)) {
+    expected_label <- "Macrophages"
+  } else if (grepl("Mono", cell_type)) {
+    expected_label <- "Monocytes"
+  } else {
+      expected_label <- cell_type
+  }
+    
+    #Calculation sensitivity: Of my true cell type, what percentage did ImmGen correctly identify?
+    total_true <- sum(atlas_cells)
+    correctly_called <- sum(atlas_cells & 
+                              MERTK_adult_filtered$ImmGen_label == expected_label)
+    validation_metrics$Sensitivity[i] <- correctly_called / total_true
+    
+    #Calculating Precision: When ImmGen makes a prediction, how often is it correct?
+    immgen_calls <- MERTK_adult_filtered$ImmGen_label == expected_label
+    true_positives <- sum(atlas_cells & immgen_calls)
+    validation_metrics$Precision[i] <- true_positives / sum(immgen_calls)
+    #F1 score 
+    P <- validation_metrics$Precision[i]
+    R <- validation_metrics$Sensitivity[i]
+    validation_metrics$F1_Score[i] <- 2 * (P * R) / (P + R)  
+  }
+print(validation_metrics)
+```
+
+
+
+
+
+
+
+B/ Imgenn Labels Atlas receives
+```{r ATLAS and IMMGEN Comparison Follow-up}
+
+#Identify Atlas SingleR annotations
+table(MERTK_adult_filtered$SingleR_label)
+
+# ImmGen labels assigned to atlas macrophages
+mac_cells <- MERTK_adult_filtered$SingleR_label %in% 
+  c("CCR2+ Mac","ARG1+ Mac","MHCII Mac","TLF Mac")
+table(MERTK_adult_filtered$ImmGen_label[mac_cells])
+
+
+# Which atlas cell types is ImmGen calling "Macrophages"?
+immgen_mac_cells <- MERTK_adult_filtered$ImmGen_label == "Macrophages"
+table(MERTK_adult_filtered$SingleR_label[immgen_mac_cells])
+
+# Are monocytes being called macrophages by ImmGen?
+mono_cells <- MERTK_adult_filtered$SingleR_label %in% 
+  c("Ly6C-hi Mono", "Ly6C-lo Mono")
+table(MERTK_adult_filtered$ImmGen_label[mono_cells])
+
+
+subtypes <- c("CCR2+ Mac", "ARG1+ Mac", "MHCII Mac", "TLF Mac")
+for (subtype in subtypes) {
+  cells <- MERTK_adult_filtered$SingleR_label == subtype
+  cat("\n", subtype, ":\n")
+  print(table(MERTK_adult_filtered$ImmGen_label[cells]))
+}
+
+
+
+```
+
+
+
+
+
+
+
+
+C/ Figures 
+
+
+Plot 1 - Labels Imgenn calls macrophages 
+```{r}
+
+library(ggplot2)
+library(dplyr)
+library(forcats)
+library(scales)
+
+# Extracting composition of ImmGen's macrophages 
+
+immgen_mac_cells <- MERTK_adult_filtered$ImmGen_label == "Macrophages"
+total_immgen_macs <- sum(immgen_mac_cells)  
+
+composition_raw <- table(MERTK_adult_filtered$SingleR_label[immgen_mac_cells])
+
+composition_df <- as.data.frame(composition_raw, stringsAsFactors = FALSE)
+colnames(composition_df) <- c("Cell_Type", "Count") 
+composition_df <- composition_df %>%
+  mutate(Pct = Count / total_immgen_macs * 100) %>%
+  arrange(desc(Count))
+
+#collapsing low-frequency occurences into "other" category and show prevalent misclassifications
+TOP_N <- 8
+top_types <- composition_df %>% slice_head(n = TOP_N)
+other_types <- composition_df %>% slice_tail(n = nrow(composition_df) - TOP_N)
+
+other_row <- data.frame(
+  Cell_Type = factor("Other"),
+  Count = sum(other_types$Count),
+  Pct   = sum(other_types$Pct)
+)
+
+plot_df <- bind_rows(top_types, other_row) %>%
+  mutate(
+    Cell_Type = as.character(Cell_Type),
+# Broad category per label
+Category = case_when(
+  grepl("Mac",                   Cell_Type) ~ "Macrophage",
+  grepl("Mono",                  Cell_Type) ~ "Monocyte",
+  Cell_Type == "B Cells"                    ~ "B Cell",        
+  Cell_Type == "VSMCs"                      ~ "VSMC",          
+  Cell_Type %in% c("NKT")                  ~ "NKT Cell",      
+  grepl("Fibro|MMT|RCF|Matrifi", Cell_Type) ~ "Fibroblast",
+  grepl("EC|Venous|Endo",        Cell_Type) ~ "Endothelial",
+  Cell_Type == "Cardiomyocytes"             ~ "Cardiomyocyte",
+  Cell_Type == "Other"                      ~ "Other",
+  TRUE                                      ~ "Other Immune"   
+),
+    # forcing macrophage subtypes into one display label 
+    Display_Label = case_when(
+      grepl("Mac", Cell_Type) ~ "Atlas Macrophages\n(CCR2+, ARG1+, MHCII, TLF)",
+      TRUE ~ Cell_Type
+    )
+  )
+
+# collapsing atlas mac subtypes into one bar
+plot_df_collapsed <- plot_df %>%
+  group_by(Display_Label, Category) %>%
+  summarise(Count = sum(Count), Pct = sum(Pct), .groups = "drop") %>%
+  arrange(desc(Count)) %>%
+  mutate(
+    Display_Label = fct_reorder(Display_Label, Count),
+    # Bar labels
+    Bar_Label = paste0(Count, "\n(", round(Pct, 1), "%)")
+  )
+
+
+category_colors <- c(
+  "Macrophage"    = "#4D9E6F",   # muted green — correct
+  "Monocyte"      = "#E07B39",   # orange
+  "B Cell"        = "#3A6BAD",   # blue — lymphoid
+  "VSMC"          = "#C0392B",   # red — non-immune
+  "NKT Cell"      = "#C75BAD",   # magenta — lymphoid
+  "Fibroblast"    = "#8B6BB1",   # purple — stromal
+  "Endothelial"   = "#2B9CB5",   # teal
+  "Cardiomyocyte" = "#8B1A1A",   # dark red
+  "Other Immune"  = "#999999",
+  "Other"         = "#BBBBBB"
+)
+
+#Plotting 
+p <- ggplot(plot_df_collapsed,
+            aes(x = Display_Label,
+                y = Pct,
+                fill = Category)) +
+
+  geom_col(width = 0.65, colour = "black", linewidth = 0.4) +  
+
+  geom_text(aes(label = Bar_Label),
+            hjust  = -0.08,
+            size   = 3.5,
+            colour = "black",
+            fontface = "plain",
+            family = "Helvetica") +
+
+  coord_flip(clip = "off",
+             ylim = c(0, max(plot_df_collapsed$Pct) * 1.32)) +
+
+  scale_fill_manual(values = category_colors, guide = "none") +
+
+  scale_y_continuous(
+    labels = function(x) paste0(x, "%"),
+    breaks = seq(0, 40, by = 10),
+    expand = expansion(mult = c(0, 0))
+  ) +
+
+  labs(
+    title    = NULL,          
+    subtitle = NULL,
+    x = NULL,
+    y = "% of ImmGen \"Macrophages\""
+  ) +
+
+  theme_classic(base_size = 13, base_family = "Helvetica") +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+
+    # Axis lines
+    axis.line.x = element_line(colour = "black", linewidth = 0.8),
+    axis.line.y = element_line(colour = "black", linewidth = 0.8),
+
+    axis.ticks.x = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks.y = element_blank(),
+
+    axis.ticks.length = unit(4, "pt"),
+
+    # Axis text
+    axis.text.y  = element_text(colour = "black", size = 12, face = "bold",
+                                hjust = 1, margin = margin(r = 4)),
+    axis.text.x  = element_text(colour = "black", size = 11),
+    axis.title.x = element_text(colour = "black", size = 12, face = "bold",
+                                margin = margin(t = 8)),
+
+    # No gridlines inside plot
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+
+    plot.margin = margin(15, 70, 12, 12)
+  )
+
+print(p)
+
+
+ggsave("/projects/b1246/Isaac/MERTK/Figures/Atlas/Classification/ImmGen_Macrophage_Composition.png",
+       plot = p, width = 7, height = 5, dpi = 300, bg = "white")  
+
+
+
+```
+
+
+# Plot 2 - Marker Validation, side by side umaps
+
+Single-R label Umaps
+```{r}
+
+library(ggplot2)
+library(Seurat)
+library(patchwork)
+library(dplyr)
+
+
+# Extracting Umap coordinates and metadata
+umap_coords <- as.data.frame(Embeddings(MERTK_adult_filtered, reduction = "umap"))
+colnames(umap_coords) <- c("UMAP_1", "UMAP_2")
+
+umap_data <- cbind(umap_coords, 
+                   SingleR_label = MERTK_adult_filtered$SingleR_label,
+                   ImmGen_label  = MERTK_adult_filtered$ImmGen_label)
+
+# Cell categories UMAP
+
+# Panel A: B Cells
+umap_data_bcells <- umap_data %>%
+  mutate(
+    Highlight = case_when(
+      SingleR_label == "B Cells" ~ "B Cells",
+      TRUE ~ "Other"
+    ),
+    Highlight = factor(Highlight, levels = c("Other", "B Cells"))  
+  )
+
+# Panel B: VSMCs  
+umap_data_vsmcs <- umap_data %>%
+  mutate(
+    Highlight = case_when(
+      SingleR_label == "VSMCs" ~ "VSMCs",
+      TRUE ~ "Other"
+    ),
+    Highlight = factor(Highlight, levels = c("Other", "VSMCs"))
+  )
+
+# Panel C: Ly6C-hi Monocytes
+umap_data_mono <- umap_data %>%
+  mutate(
+    Highlight = case_when(
+      SingleR_label == "Ly6C-hi Mono" ~ "Ly6C-hi Mono",
+      TRUE ~ "Other"
+    ),
+    Highlight = factor(Highlight, levels = c("Other", "Ly6C-hi Mono"))
+  )
+
+# Color palettes
+color_bcells <- c("Other" = "#E5E5E5", "B Cells"      = "#3A6BAD")  
+color_vsmcs  <- c("Other" = "#E5E5E5", "VSMCs"        = "#C0392B")  
+color_mono   <- c("Other" = "#E5E5E5", "Ly6C-hi Mono" = "#E07B39")  
+
+#Theme for all panels
+umap_theme <- theme_classic(base_size = 11, base_family = "Helvetica") +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    
+    # axes
+    axis.line   = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks  = element_line(colour = "black", linewidth = 0.4),
+    axis.text   = element_text(colour = "black", size = 9),
+    axis.title  = element_text(colour = "black", size = 10, face = "bold"),
+    
+    # Title
+    plot.title = element_text(colour = "black", size = 11, face = "bold", hjust = 0.5),
+    
+    # Legend
+    legend.position = "none",  # remove legend since cell type is in title
+    
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+# Panel A: B Cells 
+p_bcells <- ggplot(umap_data_bcells, aes(x = UMAP_1, y = UMAP_2, color = Highlight)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = color_bcells) +
+  labs(title = "B Cells", x = "UMAP 1", y = "UMAP 2") +
+  umap_theme
+
+#Panel B: VSMCs
+p_vsmcs <- ggplot(umap_data_vsmcs, aes(x = UMAP_1, y = UMAP_2, color = Highlight)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = color_vsmcs) +
+  labs(title = "VSMCs", x = "UMAP 1", y = "UMAP 2") +
+  umap_theme
+
+# Panel C: Ly6C-hi Monocytes
+p_mono <- ggplot(umap_data_mono, aes(x = UMAP_1, y = UMAP_2, color = Highlight)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = color_mono) +
+  labs(title = "Ly6C-hi Monocytes", x = "UMAP 1", y = "UMAP 2") +
+  umap_theme
+
+# Combine into one row
+p_combined <- p_bcells | p_vsmcs | p_mono
+
+print(p_combined)
+
+#Save 
+ggsave("/projects/b1246/Isaac/MERTK/Figures/Atlas/Classification/UMAP_Atlas_Annotations.png",
+       plot = p_combined, width = 12, height = 4, dpi = 300, bg = "white")
+
+ggsave("/projects/b1246/Isaac/MERTK/Figures/Atlas/Classification/UMAP_Atlas_Annotations.pdf",
+       plot = p_combined, width = 12, height = 4, device = cairo_pdf)
+
+#Cell counts
+cat("\n──Cell counts for highlighted populations ──\n")
+cat(sprintf("B Cells:        %d cells\n", sum(umap_data$SingleR_label == "B Cells")))
+cat(sprintf("VSMCs:          %d cells\n", sum(umap_data$SingleR_label == "VSMCs")))
+cat(sprintf("Ly6C-hi Mono:   %d cells\n", sum(umap_data$SingleR_label == "Ly6C-hi Mono")))
+
+
+```
+
+ImmGen labels Umaps
+```{r}
+
+library(ggplot2)
+library(Seurat)
+library(patchwork)
+library(dplyr)
+
+
+#Extracting umap coordinates
+umap_coords <- as.data.frame(Embeddings(MERTK_adult_filtered, reduction = "umap"))
+colnames(umap_coords) <- c("UMAP_1", "UMAP_2")
+
+umap_data <- cbind(umap_coords, 
+                   SingleR_label = MERTK_adult_filtered$SingleR_label,
+                   ImmGen_label  = MERTK_adult_filtered$ImmGen_label)
+
+
+# Panel A: B Cells misclassified as Macrophages
+umap_data_bcells <- umap_data %>%
+  mutate(
+    Highlight = case_when(
+      SingleR_label == "B Cells" & ImmGen_label == "Macrophages" ~ "B Cells → 'Macrophages'",
+      SingleR_label == "B Cells" & ImmGen_label != "Macrophages" ~ "B Cells",
+      TRUE ~ "Other"
+    ),
+    Highlight = factor(Highlight, 
+                      levels = c("Other", "B Cells", "B Cells → 'Macrophages'"))
+  )
+
+# Panel B: VSMCs misclassified as Macrophages
+umap_data_vsmcs <- umap_data %>%
+  mutate(
+    Highlight = case_when(
+      SingleR_label == "VSMCs" & ImmGen_label == "Macrophages" ~ "VSMCs → 'Macrophages'",
+      SingleR_label == "VSMCs" & ImmGen_label != "Macrophages" ~ "VSMCs",
+      TRUE ~ "Other"
+    ),
+    Highlight = factor(Highlight,
+                      levels = c("Other", "VSMCs", "VSMCs → 'Macrophages'"))
+  )
+
+# Panel C: Ly6C-hi Monocytes misclassified as Macrophages
+umap_data_mono <- umap_data %>%
+  mutate(
+    Highlight = case_when(
+      SingleR_label == "Ly6C-hi Mono" & ImmGen_label == "Macrophages" ~ "Ly6C-hi Mono → 'Macrophages'",
+      SingleR_label == "Ly6C-hi Mono" & ImmGen_label != "Macrophages" ~ "Ly6C-hi Mono",
+      TRUE ~ "Other"
+    ),
+    Highlight = factor(Highlight,
+                      levels = c("Other", "Ly6C-hi Mono", "Ly6C-hi Mono → 'Macrophages'"))
+  )
+
+#Color palettes (Red for flagged errors)
+
+color_bcells <- c(
+  "Other" = "#E5E5E5",
+  "B Cells" = "#7AA3CC",          
+  "B Cells → 'Macrophages'" = "#D32F2F"    
+)
+
+color_vsmcs <- c(
+  "Other" = "#E5E5E5",
+  "VSMCs (correct)" = "#D97B6F",           
+  "VSMCs → 'Macrophages'" = "#D32F2F"      
+)
+
+color_mono <- c(
+  "Other" = "#E5E5E5",
+  "Ly6C-hi Mono (correct)" = "#F4AA73",     
+  "Ly6C-hi Mono → 'Macrophages'" = "#D32F2F"  
+)
+
+# Base theme for each umap
+umap_theme <- theme_classic(base_size = 11, base_family = "Helvetica") +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    
+    axis.line   = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks  = element_line(colour = "black", linewidth = 0.4),
+    axis.text   = element_text(colour = "black", size = 9),
+    axis.title  = element_text(colour = "black", size = 10, face = "bold"),
+    
+    plot.title = element_text(colour = "black", size = 11, face = "bold", hjust = 0.5),
+    
+    legend.position = "right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.4, "cm"),
+    
+    plot.margin = margin(10, 5, 10, 10)
+  )
+
+#Panel A: B Cells
+p_bcells <- ggplot(umap_data_bcells, aes(x = UMAP_1, y = UMAP_2, color = Highlight)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = color_bcells) +
+  labs(title = "B Cells (ImmGen Labels)", x = "UMAP 1", y = "UMAP 2") +
+  umap_theme
+
+#Panel B: VSMCs
+p_vsmcs <- ggplot(umap_data_vsmcs, aes(x = UMAP_1, y = UMAP_2, color = Highlight)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = color_vsmcs) +
+  labs(title = "VSMCs (ImmGen Labels)", x = "UMAP 1", y = "UMAP 2") +
+  umap_theme
+
+#Panel C: Ly6C-hi Monocytes
+p_mono <- ggplot(umap_data_mono, aes(x = UMAP_1, y = UMAP_2, color = Highlight)) +
+  geom_point(size = 0.3, alpha = 0.8) +
+  scale_color_manual(values = color_mono) +
+  labs(title = "Ly6C-hi Mono (ImmGen Labels)", x = "UMAP 1", y = "UMAP 2") +
+  umap_theme
+
+#Combine
+p_combined <- p_bcells | p_vsmcs | p_mono
+
+print(p_combined)
+
+#Save
+ggsave("/projects/b1246/Isaac/MERTK/Figures/Atlas/Classification/UMAP_ImmGen_Misclassification.png",
+       plot = p_combined, width = 14, height = 4, dpi = 300, bg = "white")
+
+ggsave("/projects/b1246/Isaac/MERTK/Figures/Atlas/Classification/UMAP_ImmGen_Misclassification.pdf",
+       plot = p_combined, width = 14, height = 4, device = cairo_pdf)
+
+#Quantify the misclassification
+cat("\n── ImmGen Misclassification Statistics ──\n\n")
+
+# B Cells
+bcell_total <- sum(umap_data$SingleR_label == "B Cells")
+bcell_miscalled <- sum(umap_data$SingleR_label == "B Cells" & 
+                       umap_data$ImmGen_label == "Macrophages")
+cat(sprintf("B Cells:\n"))
+cat(sprintf("  Total: %d cells\n", bcell_total))
+cat(sprintf("  Called 'Macrophages' by ImmGen: %d (%.1f%%)\n\n", 
+            bcell_miscalled, 100 * bcell_miscalled / bcell_total))
+
+# VSMCs
+vsmc_total <- sum(umap_data$SingleR_label == "VSMCs")
+vsmc_miscalled <- sum(umap_data$SingleR_label == "VSMCs" & 
+                      umap_data$ImmGen_label == "Macrophages")
+cat(sprintf("VSMCs:\n"))
+cat(sprintf("  Total: %d cells\n", vsmc_total))
+cat(sprintf("  Called 'Macrophages' by ImmGen: %d (%.1f%%)\n\n",
+            vsmc_miscalled, 100 * vsmc_miscalled / vsmc_total))
+
+# Ly6C-hi Monocytes
+mono_total <- sum(umap_data$SingleR_label == "Ly6C-hi Mono")
+mono_miscalled <- sum(umap_data$SingleR_label == "Ly6C-hi Mono" & 
+                      umap_data$ImmGen_label == "Macrophages")
+cat(sprintf("Ly6C-hi Monocytes:\n"))
+cat(sprintf("  Total: %d cells\n", mono_total))
+cat(sprintf("  Called 'Macrophages' by ImmGen: %d (%.1f%%)\n",
+            mono_miscalled, 100 * mono_miscalled / mono_total))
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+Plot 3 - Marker Expression 
+
+
+B cells: CD79A, CD79B, CD19, MS4A1          
+Ly6C-hi monocytes:Ly6c2, Ccr2, Csf1r, Itgam 
+VSMCs: Acta2, Myh11
+
+```{r}
+
+library(ggplot2)
+library(Seurat)
+library(patchwork)
+library(dplyr)
+library(viridis)
+
+
+#Extracting UMAP coordinates
+umap_coords <- as.data.frame(Embeddings(MERTK_adult_filtered, reduction = "umap"))
+colnames(umap_coords) <- c("UMAP_1", "UMAP_2")
+
+
+# B Cells: Cd79a
+bcell_marker <- "Cd79a"
+if (!bcell_marker %in% rownames(MERTK_adult_filtered)) {
+  # Try alternative capitalizations
+  bcell_marker <- grep("^cd79a$|^CD79A$|^Cd79a$", 
+                       rownames(MERTK_adult_filtered), 
+                       value = TRUE, ignore.case = TRUE)[1]
+}
+
+# VSMCs: Acta2 
+vsmc_marker <- "Acta2"
+if (!vsmc_marker %in% rownames(MERTK_adult_filtered)) {
+  vsmc_marker <- grep("^acta2$|^ACTA2$|^Acta2$",
+                      rownames(MERTK_adult_filtered),
+                      value = TRUE, ignore.case = TRUE)[1]
+}
+
+# Ly6C-hi Monocytes: Ly6c2 
+mono_marker <- "Ly6c2"
+if (!mono_marker %in% rownames(MERTK_adult_filtered)) {
+  mono_marker <- grep("^ly6c2$|^LY6C2$|^Ly6c2$",
+                      rownames(MERTK_adult_filtered),
+                      value = TRUE, ignore.case = TRUE)[1]
+}
+
+# Extracting normalized expression
+bcell_expr <- FetchData(MERTK_adult_filtered, vars = bcell_marker, slot = "data")[,1]
+vsmc_expr  <- FetchData(MERTK_adult_filtered, vars = vsmc_marker,  slot = "data")[,1]
+mono_expr  <- FetchData(MERTK_adult_filtered, vars = mono_marker,  slot = "data")[,1]
+
+# Combining with UMAP coordinates
+umap_data_bcells <- cbind(umap_coords, Expression = bcell_expr)
+umap_data_vsmcs  <- cbind(umap_coords, Expression = vsmc_expr)
+umap_data_mono   <- cbind(umap_coords, Expression = mono_expr)
+
+#Color scale: viridis for expression
+
+expression_limits <- c(0, NA)  
+
+#Base theme for each plot 
+umap_theme <- theme_classic(base_size = 11, base_family = "Helvetica") +
+  theme(
+    plot.background  = element_rect(fill = "white", colour = NA),
+    panel.background = element_rect(fill = "white", colour = NA),
+    
+    axis.line   = element_line(colour = "black", linewidth = 0.6),
+    axis.ticks  = element_line(colour = "black", linewidth = 0.4),
+    axis.text   = element_text(colour = "black", size = 9),
+    axis.title  = element_text(colour = "black", size = 10, face = "bold"),
+    
+    plot.title = element_text(colour = "black", size = 11, face = "bold", hjust = 0.5),
+    
+    # Legend for expression scale
+    legend.position = "right",
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.text = element_text(size = 8),
+    legend.key.height = unit(0.8, "cm"),
+    legend.key.width = unit(0.3, "cm"),
+    
+    plot.margin = margin(10, 5, 10, 10)
+  )
+
+#Panel A: B Cell Marker (Cd79a)
+p_bcells <- ggplot(umap_data_bcells, aes(x = UMAP_1, y = UMAP_2, color = Expression)) +
+  geom_point(size = 0.3, alpha = 0.9) +
+  scale_color_viridis_c(option = "plasma", 
+                        limits = expression_limits,
+                        name = "Expression") +
+  labs(title = paste0("B Cells: ", bcell_marker), 
+       x = "UMAP 1", 
+       y = "UMAP 2") +
+  umap_theme
+
+#Panel B: VSMC Marker (Acta2) 
+p_vsmcs <- ggplot(umap_data_vsmcs, aes(x = UMAP_1, y = UMAP_2, color = Expression)) +
+  geom_point(size = 0.3, alpha = 0.9) +
+  scale_color_viridis_c(option = "plasma",
+                        limits = expression_limits,
+                        name = "Expression") +
+  labs(title = paste0("VSMCs: ", vsmc_marker),
+       x = "UMAP 1",
+       y = "UMAP 2") +
+  umap_theme
+
+#Panel C: Monocyte Marker (Ly6c2)
+p_mono <- ggplot(umap_data_mono, aes(x = UMAP_1, y = UMAP_2, color = Expression)) +
+  geom_point(size = 0.3, alpha = 0.9) +
+  scale_color_viridis_c(option = "plasma",
+                        limits = expression_limits,
+                        name = "Expression") +
+  labs(title = paste0("Ly6C-hi Mono: ", mono_marker),
+       x = "UMAP 1",
+       y = "UMAP 2") +
+  umap_theme
+
+#Combine
+p_combined <- p_bcells | p_vsmcs | p_mono
+
+print(p_combined)
+
+#Saving
+ggsave("/projects/b1246/Isaac/MERTK/Figures/Atlas/Classification/UMAP_Marker_Expression.png",
+       plot = p_combined, width = 14, height = 4, dpi = 300, bg = "white")
+
+ggsave("/projects/b1246/Isaac/MERTK/Figures/Atlas/Classification/UMAP_Marker_Expression.pdf",
+       plot = p_combined, width = 14, height = 4, device = cairo_pdf)
+
+#Marker Expression Statistics
+cell_types <- MERTK_adult_filtered$SingleR_label
+immgen_labels <- MERTK_adult_filtered$ImmGen_label
+
+# B Cells
+bcells_idx <- cell_types == "B Cells"
+bcells_miscalled_idx <- bcells_idx & immgen_labels == "Macrophages"
+cat(sprintf("%s expression in B Cells:\n", bcell_marker))
+cat(sprintf("  Mean in true B cells: %.2f\n", mean(bcell_expr[bcells_idx])))
+cat(sprintf("  Mean in B cells ImmGen calls 'Macrophages': %.2f\n", 
+            mean(bcell_expr[bcells_miscalled_idx])))
+cat(sprintf("  %% of B cells expressing %s (>0): %.1f%%\n\n",
+            bcell_marker, 100 * sum(bcell_expr[bcells_idx] > 0) / sum(bcells_idx)))
+
+# VSMCs
+vsmcs_idx <- cell_types == "VSMCs"
+vsmcs_miscalled_idx <- vsmcs_idx & immgen_labels == "Macrophages"
+cat(sprintf("%s expression in VSMCs:\n", vsmc_marker))
+cat(sprintf("  Mean in true VSMCs: %.2f\n", mean(vsmc_expr[vsmcs_idx])))
+cat(sprintf("  Mean in VSMCs ImmGen calls 'Macrophages': %.2f\n",
+            mean(vsmc_expr[vsmcs_miscalled_idx])))
+cat(sprintf("  %% of VSMCs expressing %s (>0): %.1f%%\n\n",
+            vsmc_marker, 100 * sum(vsmc_expr[vsmcs_idx] > 0) / sum(vsmcs_idx)))
+
+# Ly6C-hi Monocytes
+mono_idx <- cell_types == "Ly6C-hi Mono"
+mono_miscalled_idx <- mono_idx & immgen_labels == "Macrophages"
+cat(sprintf("%s expression in Ly6C-hi Monocytes:\n", mono_marker))
+cat(sprintf("  Mean in true Ly6C-hi Mono: %.2f\n", mean(mono_expr[mono_idx])))
+cat(sprintf("  Mean in Ly6C-hi Mono ImmGen calls 'Macrophages': %.2f\n",
+            mean(mono_expr[mono_miscalled_idx])))
+cat(sprintf("  %% of Ly6C-hi Mono expressing %s (>0): %.1f%%\n",
+            mono_marker, 100 * sum(mono_expr[mono_idx] > 0) / sum(mono_idx)))
+
+#Comparing true macrophages
+cat("\n── Control: Expression in TRUE Macrophages ──\n\n")
+true_macs_idx <- grepl("Mac", cell_types)
+
+cat(sprintf("%s in true Macrophages: %.2f (expected low)\n", 
+            bcell_marker, mean(bcell_expr[true_macs_idx])))
+cat(sprintf("%s in true Macrophages: %.2f (expected low)\n",
+            vsmc_marker, mean(vsmc_expr[true_macs_idx])))
+cat(sprintf("%s in true Macrophages: %.2f (expected low)\n",
+            mono_marker, mean(mono_expr[true_macs_idx])))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r ATLAS vs Immgen: Comparison figures}
+
+
+################################################################################
+# EXTENDED VALIDATION - ALL PRIORITY MISCLASSIFICATIONS
+# Includes: Monocytes (both subtypes), B cells, VSMCs, Cardiomyocytes, 
+#           Fibroblasts, AND NKT cells
+################################################################################
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+## Define all marker panels
+marker_panels <- list(
+  Mac_Resident   = c("Timd4","Lyve1","Folr2","Mrc1","Igf1","F13a1","Cd163"),
+  Mac_CCR2       = c("Ccr2","Trem2","Apoe","Cd14","H2-Ab1"),
+  Mac_MHCIIhi    = c("Runx3","Cx3cr1","Il1b","Maf","Klf2","H2-Aa","Cd74"),
+  Monocyte       = c("Ly6c2","Csf1r","Itgam","Ccr2"),
+  Bcell          = c("Cd79a","Ms4a1","Cd19","Cd79b"),
+  NK_NKT         = c("Ncr1","Klrb1c","Cd3e","Gzmb"),
+  T_markers      = c("Cd3e","Cd4","Cd8a"),
+  Endo_general   = c("Pecam1","Cdh5","Kdr","Eng"),
+  Fibro_general  = c("Cthrc1","Acta2","Fn1","Col1a1","Postn","Tagln","Pdgfra"),
+  Cardio         = c("Tnnt2","Myh6","Myl2","Ttn"),
+  VSMC           = c("Acta2","Myh11","Tagln","Cnn1"),
+  Neut           = c("Ly6g","S100a8","S100a9")
+)
+
+## Master output directory
+master_dir <- "/projects/b1246/Isaac/MERTK/Figures/ALL_Misclassifications"
+dir.create(master_dir, showWarnings = FALSE, recursive = TRUE)
+
+## Initialize summary table
+all_misclass_summary <- data.frame()
+
+## ============================================================================
+## 1. LY6C-HI MONOCYTES 
+## ============================================================================
+
+cat("\n=== VALIDATING: Ly6C-hi Monocytes ===\n")
+
+atlas_ly6chi <- MERTK_adult_filtered$SingleR_label == "Ly6C-hi Mono"
+immgen_mac <- MERTK_adult_filtered$ImmGen_label == "Macrophages"
+misclass_ly6chi <- atlas_ly6chi & immgen_mac
+
+cat("Ly6C-hi Mono misclassified:", sum(misclass_ly6chi), "\n")
+
+MERTK_adult_filtered$ly6chi_status <- "Other"
+MERTK_adult_filtered$ly6chi_status[atlas_ly6chi] <- "Atlas: Ly6C-hi Mono"
+MERTK_adult_filtered$ly6chi_status[misclass_ly6chi] <- "ImmGen: 'Macrophages'"
+
+# Markers
+mono_pos <- intersect(marker_panels$Monocyte, rownames(MERTK_adult_filtered))
+mac_neg <- intersect(c(marker_panels$Mac_Resident, marker_panels$Mac_CCR2), 
+                     rownames(MERTK_adult_filtered))
+all_markers_ly6chi <- unique(c(mono_pos, mac_neg))
+
+# Subset
+cells_ly6chi <- MERTK_adult_filtered$ly6chi_status != "Other"
+ly6chi_subset <- subset(MERTK_adult_filtered, cells = colnames(MERTK_adult_filtered)[cells_ly6chi])
+
+dir_ly6chi <- file.path(master_dir, "Ly6Chi_Monocytes")
+dir.create(dir_ly6chi, showWarnings = FALSE, recursive = TRUE)
+
+# Dot plot
+if (length(all_markers_ly6chi) > 0) {
+  p_dot <- DotPlot(ly6chi_subset, features = all_markers_ly6chi, 
+                   group.by = "ly6chi_status", cols = c("lightgrey", "red"), dot.scale = 10) +
+    coord_flip() + ggtitle("Ly6C-hi Monocytes: Marker Expression") +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  ggsave("Ly6Chi_Mono_dotplot.pdf", plot = p_dot, path = dir_ly6chi, 
+         width = 10, height = 8, dpi = 300)
+}
+
+# Violin plots
+if (length(mono_pos) >= 2) {
+  violins <- list()
+  for (marker in head(mono_pos, 4)) {
+    p <- VlnPlot(ly6chi_subset, features = marker, group.by = "ly6chi_status",
+                 pt.size = 0, cols = c("#E41A1C", "#377EB8")) +
+      ggtitle(marker) + theme(legend.position = "none", axis.title.x = element_blank())
+    violins[[marker]] <- p
+  }
+  
+  p_violin <- wrap_plots(violins, ncol = 2) +
+    plot_annotation(title = "Ly6C-hi Monocyte Canonical Marker Expression")
+  
+  ggsave("Ly6Chi_Mono_violins.pdf", plot = p_violin, path = dir_ly6chi,
+         width = 12, height = 8, dpi = 300)
+}
+
+# Export cell IDs
+write.csv(
+  data.frame(cell_id = colnames(MERTK_adult_filtered)[misclass_ly6chi],
+             atlas_label = "Ly6C-hi Mono", immgen_label = "Macrophage"),
+  file = file.path(dir_ly6chi, "misclassified_Ly6Chi_ids.csv"), row.names = FALSE
+)
+
+all_misclass_summary <- rbind(all_misclass_summary, data.frame(
+  Cell_Type = "Ly6C-hi Monocytes", N_Misclassified = sum(misclass_ly6chi),
+  Pct_of_ImmGen_Macs = round(sum(misclass_ly6chi)/sum(immgen_mac)*100, 1),
+  Classification = "Lineage Error", Category = "Myeloid"
+))
+
+
+
+## ============================================================================
+## 2. LY6C-LO MONOCYTES
+## ============================================================================
+
+cat("\n=== VALIDATING: Ly6C-lo Monocytes ===\n")
+
+atlas_ly6clo <- MERTK_adult_filtered$SingleR_label == "Ly6C-lo Mono"
+misclass_ly6clo <- atlas_ly6clo & immgen_mac
+
+cat("Ly6C-lo Mono misclassified:", sum(misclass_ly6clo), "\n")
+
+MERTK_adult_filtered$ly6clo_status <- "Other"
+MERTK_adult_filtered$ly6clo_status[atlas_ly6clo] <- "Atlas: Ly6C-lo Mono"
+MERTK_adult_filtered$ly6clo_status[misclass_ly6clo] <- "ImmGen: 'Macrophages'"
+
+# Subset
+cells_ly6clo <- MERTK_adult_filtered$ly6clo_status != "Other"
+ly6clo_subset <- subset(MERTK_adult_filtered, cells = colnames(MERTK_adult_filtered)[cells_ly6clo])
+
+dir_ly6clo <- file.path(master_dir, "Ly6Clo_Monocytes")
+dir.create(dir_ly6clo, showWarnings = FALSE, recursive = TRUE)
+
+# Dot plot
+if (length(all_markers_ly6chi) > 0) {  # Use same markers as Ly6C-hi
+  p_dot <- DotPlot(ly6clo_subset, features = all_markers_ly6chi, 
+                   group.by = "ly6clo_status", cols = c("lightgrey", "red"), dot.scale = 10) +
+    coord_flip() + ggtitle("Ly6C-lo Monocytes: Marker Expression") +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  ggsave("Ly6Clo_Mono_dotplot.pdf", plot = p_dot, path = dir_ly6clo,
+         width = 10, height = 8, dpi = 300)
+}
+
+# Export
+write.csv(
+  data.frame(cell_id = colnames(MERTK_adult_filtered)[misclass_ly6clo],
+             atlas_label = "Ly6C-lo Mono", immgen_label = "Macrophage"),
+  file = file.path(dir_ly6clo, "misclassified_Ly6Clo_ids.csv"), row.names = FALSE
+)
+
+all_misclass_summary <- rbind(all_misclass_summary, data.frame(
+  Cell_Type = "Ly6C-lo Monocytes", N_Misclassified = sum(misclass_ly6clo),
+  Pct_of_ImmGen_Macs = round(sum(misclass_ly6clo)/sum(immgen_mac)*100, 1),
+  Classification = "Lineage Error", Category = "Myeloid"
+))
+
+
+## ============================================================================
+## 3. B CELLS 
+## ============================================================================
+
+cat("\n=== VALIDATING: B Cells ===\n")
+
+atlas_bcells <- MERTK_adult_filtered$SingleR_label == "B Cells"
+misclass_bcells <- atlas_bcells & immgen_mac
+
+cat("B Cells misclassified:", sum(misclass_bcells), "\n")
+
+MERTK_adult_filtered$bcell_status <- "Other"
+MERTK_adult_filtered$bcell_status[atlas_bcells] <- "Atlas: B Cells"
+MERTK_adult_filtered$bcell_status[misclass_bcells] <- "ImmGen: 'Macrophages'"
+
+# Markers
+bcell_pos <- intersect(marker_panels$Bcell, rownames(MERTK_adult_filtered))
+all_markers_bcell <- unique(c(bcell_pos, mac_neg))
+
+# Subset
+cells_bcell <- MERTK_adult_filtered$bcell_status != "Other"
+bcell_subset <- subset(MERTK_adult_filtered, cells = colnames(MERTK_adult_filtered)[cells_bcell])
+
+dir_bcell <- file.path(master_dir, "B_Cells")
+dir.create(dir_bcell, showWarnings = FALSE, recursive = TRUE)
+
+# Dot plot
+if (length(all_markers_bcell) > 0) {
+  p_dot <- DotPlot(bcell_subset, features = all_markers_bcell,
+                   group.by = "bcell_status", cols = c("lightgrey", "blue"), dot.scale = 10) +
+    coord_flip() + ggtitle("B Cells: Marker Expression") +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  ggsave("BCells_dotplot.pdf", plot = p_dot, path = dir_bcell,
+         width = 10, height = 8, dpi = 300)
+}
+
+# Violin plots
+if (length(bcell_pos) >= 2) {
+  violins <- list()
+  for (marker in bcell_pos) {
+    p <- VlnPlot(bcell_subset, features = marker, group.by = "bcell_status",
+                 pt.size = 0, cols = c("#1F78B4", "#E41A1C")) +
+      ggtitle(marker) + theme(legend.position = "none", axis.title.x = element_blank())
+    violins[[marker]] <- p
+  }
+  
+  p_violin <- wrap_plots(violins, ncol = 2) +
+    plot_annotation(title = "B Cell Canonical Marker Expression")
+  
+  ggsave("BCells_violins.pdf", plot = p_violin, path = dir_bcell,
+         width = 12, height = 8, dpi = 300)
+}
+
+# Export
+write.csv(
+  data.frame(cell_id = colnames(MERTK_adult_filtered)[misclass_bcells],
+             atlas_label = "B Cells", immgen_label = "Macrophage"),
+  file = file.path(dir_bcell, "misclassified_BCells_ids.csv"), row.names = FALSE
+)
+
+all_misclass_summary <- rbind(all_misclass_summary, data.frame(
+  Cell_Type = "B Cells", N_Misclassified = sum(misclass_bcells),
+  Pct_of_ImmGen_Macs = round(sum(misclass_bcells)/sum(immgen_mac)*100, 1),
+  Classification = "Cross-Lineage", Category = "Lymphoid"
+))
+
+
+## ============================================================================
+## 4. NKT CELLS 
+## ============================================================================
+
+cat("\n=== VALIDATING: NKT Cells ===\n")
+
+atlas_nkt <- MERTK_adult_filtered$SingleR_label == "NKT"
+misclass_nkt <- atlas_nkt & immgen_mac
+
+cat("NKT cells misclassified:", sum(misclass_nkt), "\n")
+
+MERTK_adult_filtered$nkt_status <- "Other"
+MERTK_adult_filtered$nkt_status[atlas_nkt] <- "Atlas: NKT"
+MERTK_adult_filtered$nkt_status[misclass_nkt] <- "ImmGen: 'Macrophages'"
+
+# Markers
+nkt_pos <- intersect(c(marker_panels$NK_NKT, marker_panels$T_markers), 
+                     rownames(MERTK_adult_filtered))
+all_markers_nkt <- unique(c(nkt_pos, mac_neg))
+
+# Subset
+cells_nkt <- MERTK_adult_filtered$nkt_status != "Other"
+nkt_subset <- subset(MERTK_adult_filtered, cells = colnames(MERTK_adult_filtered)[cells_nkt])
+
+dir_nkt <- file.path(master_dir, "NKT_Cells")
+dir.create(dir_nkt, showWarnings = FALSE, recursive = TRUE)
+
+# Dot plot
+if (length(all_markers_nkt) > 0) {
+  p_dot <- DotPlot(nkt_subset, features = all_markers_nkt,
+                   group.by = "nkt_status", cols = c("lightgrey", "purple"), dot.scale = 10) +
+    coord_flip() + ggtitle("NKT Cells: Marker Expression") +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  ggsave("NKT_dotplot.pdf", plot = p_dot, path = dir_nkt,
+         width = 10, height = 8, dpi = 300)
+}
+
+# Violin plots
+if (length(nkt_pos) >= 2) {
+  violins <- list()
+  for (marker in head(nkt_pos, 4)) {
+    p <- VlnPlot(nkt_subset, features = marker, group.by = "nkt_status",
+                 pt.size = 0, cols = c("#9467BD", "#E41A1C")) +
+      ggtitle(marker) + theme(legend.position = "none", axis.title.x = element_blank())
+    violins[[marker]] <- p
+  }
+  
+  p_violin <- wrap_plots(violins, ncol = 2) +
+    plot_annotation(title = "NKT Cell Canonical Marker Expression")
+  
+  ggsave("NKT_violins.pdf", plot = p_violin, path = dir_nkt,
+         width = 12, height = 8, dpi = 300)
+}
+
+# Export
+write.csv(
+  data.frame(cell_id = colnames(MERTK_adult_filtered)[misclass_nkt],
+             atlas_label = "NKT", immgen_label = "Macrophage"),
+  file = file.path(dir_nkt, "misclassified_NKT_ids.csv"), row.names = FALSE
+)
+
+all_misclass_summary <- rbind(all_misclass_summary, data.frame(
+  Cell_Type = "NKT Cells", N_Misclassified = sum(misclass_nkt),
+  Pct_of_ImmGen_Macs = round(sum(misclass_nkt)/sum(immgen_mac)*100, 1),
+  Classification = "Cross-Lineage", Category = "Lymphoid"
+))
+
+
+## ============================================================================
+## 5. VSMCs
+## ============================================================================
+
+cat("\n=== VALIDATING: VSMCs ===\n")
+
+atlas_vsmc <- MERTK_adult_filtered$SingleR_label %in% c("VSMCs", "Transitional MMT")
+misclass_vsmc <- atlas_vsmc & immgen_mac
+
+cat("VSMCs misclassified:", sum(misclass_vsmc), "\n")
+
+MERTK_adult_filtered$vsmc_status <- "Other"
+MERTK_adult_filtered$vsmc_status[atlas_vsmc] <- "Atlas: VSMCs"
+MERTK_adult_filtered$vsmc_status[misclass_vsmc] <- "ImmGen: 'Macrophages'"
+
+# Markers
+vsmc_pos <- intersect(marker_panels$VSMC, rownames(MERTK_adult_filtered))
+all_markers_vsmc <- unique(c(vsmc_pos, mac_neg))
+
+# Subset
+cells_vsmc <- MERTK_adult_filtered$vsmc_status != "Other"
+vsmc_subset <- subset(MERTK_adult_filtered, cells = colnames(MERTK_adult_filtered)[cells_vsmc])
+
+dir_vsmc <- file.path(master_dir, "VSMCs")
+dir.create(dir_vsmc, showWarnings = FALSE, recursive = TRUE)
+
+# Dot plot
+if (length(all_markers_vsmc) > 0) {
+  p_dot <- DotPlot(vsmc_subset, features = all_markers_vsmc,
+                   group.by = "vsmc_status", cols = c("lightgrey", "red"), dot.scale = 10) +
+    coord_flip() + ggtitle("VSMCs: Marker Expression") +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  ggsave("VSMCs_dotplot.pdf", plot = p_dot, path = dir_vsmc,
+         width = 10, height = 8, dpi = 300)
+}
+
+# Export
+write.csv(
+  data.frame(cell_id = colnames(MERTK_adult_filtered)[misclass_vsmc],
+             atlas_label = MERTK_adult_filtered$SingleR_label[misclass_vsmc],
+             immgen_label = "Macrophage"),
+  file = file.path(dir_vsmc, "misclassified_VSMCs_ids.csv"), row.names = FALSE
+)
+
+all_misclass_summary <- rbind(all_misclass_summary, data.frame(
+  Cell_Type = "VSMCs", N_Misclassified = sum(misclass_vsmc),
+  Pct_of_ImmGen_Macs = round(sum(misclass_vsmc)/sum(immgen_mac)*100, 1),
+  Classification = "Non-Immune", Category = "Stromal"
+))
+
+
+## ============================================================================
+## 6. CARDIOMYOCYTES 
+## ============================================================================
+
+cat("\n=== VALIDATING: Cardiomyocytes ===\n")
+
+atlas_cardio <- MERTK_adult_filtered$SingleR_label == "Cardiomyocytes"
+misclass_cardio <- atlas_cardio & immgen_mac
+
+cat("Cardiomyocytes misclassified:", sum(misclass_cardio), "\n")
+
+MERTK_adult_filtered$cardio_status <- "Other"
+MERTK_adult_filtered$cardio_status[atlas_cardio] <- "Atlas: Cardiomyocytes"
+MERTK_adult_filtered$cardio_status[misclass_cardio] <- "ImmGen: 'Macrophages'"
+
+# Markers
+cardio_pos <- intersect(marker_panels$Cardio, rownames(MERTK_adult_filtered))
+all_markers_cardio <- unique(c(cardio_pos, mac_neg))
+
+# Subset
+cells_cardio <- MERTK_adult_filtered$cardio_status != "Other"
+cardio_subset <- subset(MERTK_adult_filtered, cells = colnames(MERTK_adult_filtered)[cells_cardio])
+
+dir_cardio <- file.path(master_dir, "Cardiomyocytes")
+dir.create(dir_cardio, showWarnings = FALSE, recursive = TRUE)
+
+# Dot plot
+if (length(all_markers_cardio) > 0) {
+  p_dot <- DotPlot(cardio_subset, features = all_markers_cardio,
+                   group.by = "cardio_status", cols = c("lightgrey", "red"), dot.scale = 10) +
+    coord_flip() + ggtitle("Cardiomyocytes: Marker Expression") +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  ggsave("Cardiomyocytes_dotplot.pdf", plot = p_dot, path = dir_cardio,
+         width = 10, height = 8, dpi = 300)
+}
+
+# Violin plots
+if (length(cardio_pos) >= 2) {
+  violins <- list()
+  for (marker in cardio_pos) {
+    p <- VlnPlot(cardio_subset, features = marker, group.by = "cardio_status",
+                 pt.size = 0, cols = c("#E41A1C", "#377EB8")) +
+      ggtitle(marker) + theme(legend.position = "none", axis.title.x = element_blank())
+    violins[[marker]] <- p
+  }
+  
+  p_violin <- wrap_plots(violins, ncol = 2) +
+    plot_annotation(title = "Cardiomyocyte Canonical Marker Expression")
+  
+  ggsave("Cardiomyocytes_violins.pdf", plot = p_violin, path = dir_cardio,
+         width = 12, height = 8, dpi = 300)
+}
+
+# Export
+write.csv(
+  data.frame(cell_id = colnames(MERTK_adult_filtered)[misclass_cardio],
+             atlas_label = "Cardiomyocytes", immgen_label = "Macrophage"),
+  file = file.path(dir_cardio, "misclassified_Cardiomyocytes_ids.csv"), row.names = FALSE
+)
+
+all_misclass_summary <- rbind(all_misclass_summary, data.frame(
+  Cell_Type = "Cardiomyocytes", N_Misclassified = sum(misclass_cardio),
+  Pct_of_ImmGen_Macs = round(sum(misclass_cardio)/sum(immgen_mac)*100, 1),
+  Classification = "Non-Immune", Category = "Parenchymal"
+))
+
+
+
+## ============================================================================
+## MASTER SUMMARY
+## ============================================================================
+
+# Sort by number of misclassified
+all_misclass_summary <- all_misclass_summary %>%
+  arrange(desc(N_Misclassified))
+
+print("\n========================================")
+print("MASTER SUMMARY OF ALL VALIDATIONS")
+print("========================================")
+print(all_misclass_summary)
+
+# Save
+write.csv(
+  all_misclass_summary,
+  file = file.path(master_dir, "ALL_misclassifications_summary.csv"),
+  row.names = FALSE
+)
+
+## Summary plot
+p_summary <- ggplot(all_misclass_summary, 
+                    aes(x = reorder(Cell_Type, N_Misclassified), 
+                        y = N_Misclassified, fill = Classification)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = paste0(N_Misclassified, " (", Pct_of_ImmGen_Macs, "%)")), 
+            hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Lineage Error" = "#e74c3c",      # Red - same lineage but different stage
+      "Cross-Lineage" = "#f39c12",      # Orange - different immune lineage
+      "Non-Immune" = "#9b59b6"          # Purple - non-immune tissue
+    ),
+    name = "Error Type"
+  ) +
+  labs(
+    title = "Reference-Based Annotation Errors in Cardiac Tissue",
+    subtitle = "ImmGen reference misclassification of non-macrophage cell types",
+    x = "Cell Type",
+    y = "Number of Misclassified Cells"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, color = "gray30"),
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    panel.grid.major.y = element_blank()
+  ) +
+  ylim(0, max(all_misclass_summary$N_Misclassified) * 1.15)
+
+ggsave(
+  "ALL_misclassifications_summary_plot.pdf",
+  plot = p_summary,
+  path = master_dir,
+  width = 12, height = 8, dpi = 300
+)
+
+
+cat("Total misclassified cells:", sum(all_misclass_summary$N_Misclassified), "\n")
+cat("Percentage of ImmGen 'macrophage' calls:", 
+    round(sum(all_misclass_summary$N_Misclassified)/sum(immgen_mac)*100, 1), "%\n")
+cat("All outputs saved to:", master_dir, "\n")
+
+
+
+```
+
+
+
+
+
+
+Relationship between ImmGen precision and atlas cell-type prevalence.
+```{r Precision-Prevalence Relationship}
+################################################################################
+# PRECISION-PREVALENCE ANALYSIS
+# Precision vs. prevalence plots
+################################################################################
+
+library(dplyr)
+library(ggplot2)
+
+## --- Calculate metrics ---
+total_cells <- ncol(MERTK_adult_filtered)
+mac_subtypes <- c("CCR2+ Mac", "ARG1+ Mac", "MHCII Mac", "TLF Mac")
+
+prevalence_data <- data.frame()
+
+for (subtype in mac_subtypes) {
+  atlas_is_type <- MERTK_adult_filtered$SingleR_label == subtype
+  immgen_calls_mac <- MERTK_adult_filtered$ImmGen_label == "Macrophages"
+  
+  n_true <- sum(atlas_is_type)
+  true_positives <- sum(atlas_is_type & immgen_calls_mac)
+  
+  prevalence <- (n_true / total_cells) * 100
+  precision <- (true_positives / sum(immgen_calls_mac)) * 100
+  
+  prevalence_data <- rbind(prevalence_data, data.frame(
+    Subtype = subtype,
+    Cells = n_true,
+    Prevalence = prevalence,
+    Precision = precision
+  ))
+}
+
+prevalence_data <- prevalence_data %>% arrange(desc(Prevalence))
+
+## --- Output directory ---
+output_dir <- "/projects/b1246/Isaac/MERTK/Figures/Precision_Prevalence_Analysis"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+## --- Statistical analysis ---
+cor_test <- cor.test(prevalence_data$Prevalence, prevalence_data$Precision)
+model <- lm(Precision ~ Prevalence, data = prevalence_data)
+
+cat("\nCorrelation: r =", round(cor_test$estimate, 3), 
+    ", p =", format.pval(cor_test$p.value, digits = 3), "\n")
+cat("R² =", round(summary(model)$r.squared, 3), "\n\n")
+
+print(prevalence_data)
+
+write.csv(prevalence_data, 
+          file.path(output_dir, "precision_prevalence_data.csv"), 
+          row.names = FALSE)
+
+## ============================================================================
+## PLOT 1: SCATTER PLOT WITH REGRESSION
+## ============================================================================
+
+p1 <- ggplot(prevalence_data, aes(x = Prevalence, y = Precision)) +
+  geom_smooth(method = "lm", se = TRUE, color = "#2c3e50", 
+              fill = "#95a5a6", alpha = 0.3, linewidth = 1) +
+  geom_point(aes(size = Cells), color = "#e74c3c", alpha = 0.8) +
+  geom_text(aes(label = Subtype), vjust = -1.5, size = 4, fontface = "bold") +
+  
+  annotate("text", 
+           x = max(prevalence_data$Prevalence) * 0.65, 
+           y = min(prevalence_data$Precision) * 2,
+           label = sprintf("r = %.3f\nR² = %.3f\np = %.3f", 
+                          cor_test$estimate, 
+                          summary(model)$r.squared, 
+                          cor_test$p.value),
+           size = 4.5, hjust = 0, fontface = "bold", color = "#2c3e50") +
+  
+  labs(
+    title = "Reference Annotation Precision Depends on Cell Type Prevalence",
+    x = "Prevalence in Cardiac Tissue (%)",
+    y = "Annotation Precision (%)",
+    size = "Cells"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 12, face = "bold"),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  ) +
+  
+  scale_size_continuous(range = c(6, 15)) +
+  scale_y_continuous(breaks = seq(0, 100, 10), limits = c(0, max(prevalence_data$Precision) * 1.15))
+
+print(p1)
+
+ggsave("precision_prevalence_scatter.pdf", plot = p1, path = output_dir,
+       width = 9, height = 6, dpi = 300)
+
+## ============================================================================
+## PLOT 2: DUAL-AXIS COMPARISON
+## ============================================================================
+
+prevalence_data$Subtype <- factor(prevalence_data$Subtype, 
+                                   levels = prevalence_data$Subtype)
+
+scale_factor <- max(prevalence_data$Prevalence) / max(prevalence_data$Precision)
+
+p2 <- ggplot(prevalence_data, aes(x = Subtype)) +
+  
+  # Prevalence bars
+  geom_bar(aes(y = Prevalence), stat = "identity", 
+           fill = "#3498db", alpha = 0.7, width = 0.6) +
+  
+  # Precision line and points
+  geom_line(aes(y = Precision * scale_factor, group = 1), 
+            color = "#e74c3c", linewidth = 1.8) +
+  geom_point(aes(y = Precision * scale_factor), 
+             color = "#e74c3c", size = 5) +
+  
+  scale_y_continuous(
+    name = "Prevalence (%)",
+    sec.axis = sec_axis(~./scale_factor, name = "Precision (%)")
+  ) +
+  
+  labs(
+    title = "Annotation Precision Degrades with Cell Type Rarity",
+    x = "Macrophage Subtype"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 11, face = "bold"),
+    axis.title.y.left = element_text(color = "#3498db", face = "bold", size = 12),
+    axis.title.y.right = element_text(color = "#e74c3c", face = "bold", size = 12),
+    axis.text.y.left = element_text(color = "#3498db", size = 10),
+    axis.text.y.right = element_text(color = "#e74c3c", size = 10),
+    axis.title.x = element_text(size = 12, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(p2)
+
+ggsave("precision_prevalence_dual_axis.pdf", plot = p2, path = output_dir,
+       width = 9, height = 6, dpi = 300)
+
+## --- Summary ---
+cat("\n=== ANALYSIS COMPLETE ===\n")
+cat("Outputs saved to:", output_dir, "\n")
+cat("  - precision_prevalence_data.csv\n")
+cat("  - precision_prevalence_scatter.pdf\n")
+cat("  - precision_prevalence_dual_axis.pdf\n\n")
+
+cat("Key finding: Precision ranges from", 
+    round(min(prevalence_data$Precision), 1), "% to",
+    round(max(prevalence_data$Precision), 1), "%\n")
+cat("as prevalence ranges from", 
+    round(min(prevalence_data$Prevalence), 2), "% to",
+    round(max(prevalence_data$Prevalence), 2), "%\n")
+
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################
+PSEUDOTIME ANALYSIS 
+PSEUDOTIME ANALYSIS 
+PSEUDOTIME ANALYSIS 
+#######################################
+
+
+
+```{r Separating Adult KO vs WT conditions}
+
+MERTK_adult <- mertk_adult
+table(MERTK_adult$group)
+
+# Subset into KO and WT
+MERTK_KO <- subset(MERTK_adult, subset = group == "KO_Adult")
+MERTK_WT <- subset(MERTK_adult, subset = group == "WT_Adult")
+
+# Sanity check
+cat("KO cells:", ncol(MERTK_KO), "\n")
+cat("WT cells:", ncol(MERTK_WT), "\n")
+
+table(MERTK_KO$group)
+table(MERTK_WT$group)
+```
+
+
+```{r}
+saveRDS(MERTK_KO,
+        file = "/scratch/inm3056/MERTK_KO.rds")
+```
+
+```{r}
+saveRDS(MERTK_WT,
+        file = "/scratch/inm3056/MERTK_WT.rds")
+```
+
+
+
+################################
+PSEUDOTIME _ MAC/MONO SUBSETTING 
+################################
+
+
+
+
+```{r Subsetting Macrophages and Monocytes}
+
+library(SeuratWrappers)
+
+cds_WT <- as.cell_data_set(MERTK_WT)
+cds_KO <- as.cell_data_set(MERTK_KO)
+
+myeloid_labels <- c(
+  "ARG1+ Mac", "CCR2+ Mac", "MHCII Mac", "TLF Mac",
+  "Ly6C-hi Mono", "Ly6C-lo Mono"
+)
+
+cds_WT <- cds_WT[, cds_WT$SingleR_label %in% myeloid_labels]
+cds_KO <- cds_KO[, cds_KO$SingleR_label %in% myeloid_labels]
+
+table(cds_WT$SingleR_label)
+table(cds_KO$SingleR_label)
+
+
+
+```
+```{r}
+
+cds_WT <- preprocess_cds(cds_WT, num_dim = 30)
+cds_WT <- reduce_dimension(cds_WT, reduction_method = "UMAP")
+cds_WT <- cluster_cells(cds_WT)
+
+cds_KO <- preprocess_cds(cds_KO, num_dim = 30)
+cds_KO <- reduce_dimension(cds_KO, reduction_method = "UMAP")
+cds_KO <- cluster_cells(cds_KO)
+cds_WT <- learn_graph(cds_WT)
+cds_KO <- learn_graph(cds_KO)
+
+WT_root <- colnames(cds_WT)[cds_WT$SingleR_label == "Ly6C-hi Mono"]
+KO_root <- colnames(cds_KO)[cds_KO$SingleR_label == "Ly6C-hi Mono"]
+
+cds_WT <- order_cells(cds_WT, root_cells = WT_root)
+cds_KO <- order_cells(cds_KO, root_cells = KO_root)
+
+
+```
+
+```{r Plotting by pseudotime}
+
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+### ---- WT BASE PLOT ----
+wt_plot_base <- plot_cells(
+  cds_WT,
+  color_cells_by = "pseudotime",
+  label_cell_groups = FALSE,
+  label_leaves = TRUE,
+  label_branch_points = TRUE,
+  graph_label_size = 4,
+  cell_size = 1.0,
+  alpha = 0.85,
+  show_trajectory_graph = TRUE
+)
+
+### ---- Extract coordinates ----
+wt_coords <- as.data.frame(reducedDims(cds_WT)$UMAP)
+wt_coords$label <- cds_WT$SingleR_label
+colnames(wt_coords)[1:2] <- c("UMAP_1", "UMAP_2")
+
+### ---- Compute centroids ----
+wt_centroids <- wt_coords %>%
+  group_by(label) %>%
+  summarise(
+    x = median(UMAP_1),
+    y = median(UMAP_2)
+  )
+
+wt_pseudotime_umap <- wt_plot_base +
+  geom_text_repel(
+    data = wt_centroids,
+    aes(x = x, y = y, label = label),
+    size = 6,
+    fontface = "bold",
+    color = "black",
+    point.padding = 0.6,
+    box.padding = 0.7,
+    segment.color = "gray40",
+    max.overlaps = Inf
+  ) +
+  scale_color_viridis_c(option = "plasma", name = "Pseudotime") +
+  theme_bw(base_size = 18) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+wt_pseudotime_umap
+
+
+### ---- KO BASE PLOT ----
+ko_plot_base <- plot_cells(
+  cds_KO,
+  color_cells_by = "pseudotime",
+  label_cell_groups = FALSE,
+  label_leaves = TRUE,
+  label_branch_points = TRUE,
+  graph_label_size = 4,
+  cell_size = 1.0,
+  alpha = 0.85,
+  show_trajectory_graph = TRUE
+)
+
+### ---- Extract coordinates ----
+ko_coords <- as.data.frame(reducedDims(cds_KO)$UMAP)
+ko_coords$label <- cds_KO$SingleR_label
+colnames(ko_coords)[1:2] <- c("UMAP_1", "UMAP_2")
+
+### ---- Compute centroids ----
+ko_centroids <- ko_coords %>%
+  group_by(label) %>%
+  summarise(
+    x = median(UMAP_1),
+    y = median(UMAP_2)
+  )
+
+### ---- Final KO pseudotime UMAP ----
+ko_pseudotime_umap <- ko_plot_base +
+  geom_text_repel(
+    data = ko_centroids,
+    aes(x = x, y = y, label = label),
+    size = 6,
+    fontface = "bold",
+    color = "black",
+    point.padding = 0.6,
+    box.padding = 0.7,
+    segment.color = "gray40",
+    max.overlaps = Inf
+  ) +
+  scale_color_viridis_c(option = "plasma", name = "Pseudotime") +
+  theme_bw(base_size = 18) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text = element_text(size = 12),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_blank()
+  )
+
+ko_pseudotime_umap
+
+```
+
+
+
+```{r Pseudotime Gene Differential Expression}
+
+genes_all <- c(
+  # Monocyte → macrophage
+  "Ly6c2","Ccr2","Lgals3","Cd14",
+  
+  # M1 / inflammatory
+  "Il1b","Tnf","Nos2","Nfkbia","S100a8","S100a9",
+  
+  # M2 / reparative
+  "Arg1","Retnla","Chil3","Mrc1",
+  
+  # Efferocytosis / MerTK pathway
+  "Mertk","Axl","Tyro3","Gas6","Mfge8","Cd36","Lrp1",
+  
+  # Antigen presentation
+  "H2-Ab1","H2-Aa","Cd74","Ciita",
+  
+  # Tissue resident macrophages
+  "Timd4","Cd163","Vsig4","Marco",
+  
+  # Repair/fibrosis associated
+  "Spp1","Fn1"
+)
+
+rowData(cds_WT)$gene_short_name <- rownames(cds_WT)
+rowData(cds_KO)$gene_short_name <- rownames(cds_KO)
+
+valid_genes <- genes_all[genes_all %in% rownames(cds_WT)]
+valid_genes
+
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+plot_three_genes <- function(cds, genelist) {
+  
+  plist <- list()
+  
+  for (g in genelist) {
+    df <- data.frame(
+      pseudotime = pseudotime(cds),
+      expr = exprs(cds)[g,],
+      label = cds$SingleR_label
+    )
+    
+    df$expr_log <- log10(df$expr + 1e-6)
+    
+    p <- ggplot(df, aes(pseudotime, expr_log, color = label)) +
+      geom_point(size = 0.5, alpha = 0.35) +
+      geom_smooth(se = FALSE, size = 1.2) +
+      labs(title = g, y = "log10(expr + 1e-6)", x = "Pseudotime") +
+      theme_bw(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold", size = 18),
+        legend.position = "right",
+        legend.title = element_text(size = 12),
+        legend.text = element_text(size = 10)
+      )
+    
+    plist[[g]] <- p
+  }
+  
+  wrap_plots(plist, ncol = 1)
+}
+
+gene_groups <- split(valid_genes, ceiling(seq_along(valid_genes)/3))
+gene_groups
+
+WT_plots <- lapply(gene_groups, function(g) plot_three_genes(cds_WT, g))
+WT_plots[[1]]   # show the first 3-gene plot
+
+KO_plots <- lapply(gene_groups, function(g) plot_three_genes(cds_KO, g))
+KO_plots[[1]]   # first KO plot
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##############################################
+
+              CELLCHAT 
+              
+##############################################
+
+```{r Cell Chat Data Preprocessing}
+## Load the required libraries
+library(CellChat)
+library(patchwork)
+options(stringsAsFactors = FALSE)
+
+# Part I: Data input & processing and initialization of CellChat object
+
+MERTK_WT_cellchat <- createCellChat(object = MERTK_WT, meta = meta, group.by = "SingleR_label")
+MERTK_KO_cellchat <- createCellChat(object = MERTK_KO, meta = meta, group.by = "SingleR_label")
+
+```
+
+
+
+
+
+#############################################################
+#FIGURES 
+#FIGURES 
+#FIGURES 
+############################################################
+
+```{r Figure 1: Cardiac Atlas Creation}
+
+
+library(ggplot2)
+library(grid)
+library(gridExtra)
+
+# Atlas integration workflow diagram
+create_accurate_workflow <- function() {
+  
+  # Stage 1: Per-dataset processing
+  # Top row: 4 datasets (equally spaced)
+  datasets <- data.frame(
+    x = c(1.5, 3, 4.5, 6),
+    y = rep(8.5, 4),
+    width = rep(1.2, 4),
+    label = c("E-MTAB-13264\n(HFrEF)", 
+              "E-MTAB-9816\n(MI: 1D, 3D, 7D)", 
+              "GSE119355\n(MI)", 
+              "E-MTAB-7895\n(MI: 1D, 3D, 7D)"),
+    type = "dataset",
+    stringsAsFactors = FALSE
+  )
+  
+  # Middle row: Processing pipeline (equally spaced)
+  stage1_process <- data.frame(
+    x = c(2.25, 4, 5.75),
+    y = rep(7.5, 3),
+    width = rep(1.4, 3),
+    label = c("QC filtering &\nNormalization", 
+              "Initial SCTransform\n(per dataset)",
+              "Save 8 individual\nobjects"),
+    type = c("qc", "qc", "save"),
+    stringsAsFactors = FALSE
+  )
+  
+  # Stage 2: Integration preparation (6 boxes, equally spaced)
+  stage2_data <- data.frame(
+    x = seq(1, 7, length.out = 6),
+    y = rep(5.8, 6),
+    width = rep(1, 6),
+    label = c("Load 8\nobjects", 
+              "Add cell IDs\n(dataset prefix)",
+              "Map genes:\nSymbol → Ensembl\n(biomaRt)",
+              "Enforce common\ngene universe\n(all datasets)",
+              "Re-run SCT\n(full genes)",
+              "PrepSCT\nIntegration"),
+    type = "prep",
+    stringsAsFactors = FALSE
+  )
+  
+  # Stage 3: Integration (5 boxes, equally spaced)
+  stage3_data <- data.frame(
+    x = seq(1.2, 6.8, length.out = 5),
+    y = rep(4.3, 5),
+    width = rep(1.05, 5),
+    label = c("Select 3000\nintegration\nfeatures",
+              "Find integration\nanchors\n(30 PCs)",
+              "IntegrateData\n(SCT method)",
+              "RunPCA\n(30 PCs)",
+              "RunUMAP +\nClustering\n(res 0.1-0.9)"),
+    type = "integration",
+    stringsAsFactors = FALSE
+  )
+  
+  # Combine all elements
+  all_boxes <- rbind(
+    cbind(datasets, stage = 1),
+    cbind(stage1_process, stage = 1),
+    cbind(stage2_data, stage = 2),
+    cbind(stage3_data, stage = 3)
+  )
+  
+  # Arrows for Stage 1
+  arrows_datasets <- data.frame(
+    x1 = c(1.5, 3, 4.5, 6),
+    y1 = rep(8.3, 4),
+    x2 = c(1.5, 3, 4.5, 6),
+    y2 = rep(7.8, 4)
+  )
+  
+  arrows1_process <- data.frame(
+    x1 = c(2.95, 4.7),
+    y1 = rep(7.5, 2),
+    x2 = c(3.3, 5.05),
+    y2 = rep(7.5, 2)
+  )
+  
+  # Between stage 1 and 2
+  arrows_s1_s2 <- data.frame(
+    x1 = 4, y1 = 7.15, x2 = 4, y2 = 6.15
+  )
+  
+  # Stage 2 arrows
+  arrows2 <- data.frame(
+    x1 = stage2_data$x[1:5] + 0.5,
+    y1 = rep(5.8, 5),
+    x2 = stage2_data$x[2:6] - 0.5,
+    y2 = rep(5.8, 5)
+  )
+  
+  # Between stage 2 and 3
+  arrows_s2_s3 <- data.frame(
+    x1 = 4, y1 = 5.45, x2 = 4, y2 = 4.65
+  )
+  
+  # Stage 3 arrows
+  arrows3 <- data.frame(
+    x1 = stage3_data$x[1:4] + 0.525,
+    y1 = rep(4.3, 4),
+    x2 = stage3_data$x[2:5] - 0.525,
+    y2 = rep(4.3, 4)
+  )
+  
+  # Color scheme
+  colors <- c(
+    "dataset" = "#2563eb",
+    "qc" = "#059669",
+    "save" = "#7c3aed",
+    "prep" = "#d97706",
+    "integration" = "#dc2626"
+  )
+  
+  # Create plot
+  p <- ggplot() +
+    # Stage backgrounds
+    annotate("rect", xmin = 0.5, xmax = 7.5, ymin = 7.05, ymax = 8.85,
+             fill = "#e0f2fe", alpha = 0.4, color = "#0284c7", size = 0.8) +
+    annotate("rect", xmin = 0.5, xmax = 7.5, ymin = 5.45, ymax = 6.15,
+             fill = "#fef3c7", alpha = 0.4, color = "#d97706", size = 0.8) +
+    annotate("rect", xmin = 0.5, xmax = 7.5, ymin = 3.95, ymax = 4.65,
+             fill = "#fee2e2", alpha = 0.4, color = "#dc2626", size = 0.8) +
+    
+    # Stage labels
+    annotate("text", x = 0.55, y = 8.75, 
+             label = "Stage 1: Per-dataset QC, normalization & SCTransform",
+             hjust = 0, fontface = "bold", size = 3.2, color = "gray20") +
+    annotate("text", x = 0.55, y = 6.1, 
+             label = "Stage 2: Standardization for integration (gene mapping, common universe, re-SCT)",
+             hjust = 0, fontface = "bold", size = 3.2, color = "gray20") +
+    annotate("text", x = 0.55, y = 4.6, 
+             label = "Stage 3: SCT-based integration (Seurat v5)",
+             hjust = 0, fontface = "bold", size = 3.2, color = "gray20") +
+    
+    # Annotation for Stage 1
+    annotate("text", x = 3.75, y = 8, 
+             label = "↓ Each dataset processed individually ↓",
+             hjust = 0.5, fontface = "italic", size = 2.6, color = "gray40") +
+    
+    # Draw boxes
+    geom_tile(data = all_boxes,
+              aes(x = x, y = y, width = width, height = 0.35, fill = type),
+              color = "white", size = 1.2, alpha = 0.95) +
+    
+    # Add labels
+    geom_text(data = all_boxes,
+              aes(x = x, y = y, label = label),
+              size = 2.3, color = "white", fontface = "bold", 
+              lineheight = 0.8, hjust = 0.5, vjust = 0.5) +
+    
+    # Dataset arrows
+    geom_segment(data = arrows_datasets,
+                 aes(x = x1, y = y1, xend = x2, yend = y2),
+                 arrow = arrow(length = unit(0.08, "cm"), type = "closed"),
+                 color = "gray50", size = 0.4) +
+    
+    # Stage 1 process arrows
+    geom_segment(data = arrows1_process,
+                 aes(x = x1, y = y1, xend = x2, yend = y2),
+                 arrow = arrow(length = unit(0.1, "cm"), type = "closed"),
+                 color = "gray40", size = 0.5) +
+    
+    # Between stages arrows
+    geom_segment(data = arrows_s1_s2,
+                 aes(x = x1, y = y1, xend = x2, yend = y2),
+                 arrow = arrow(length = unit(0.12, "cm"), type = "closed"),
+                 color = "gray20", size = 0.8) +
+    geom_segment(data = arrows_s2_s3,
+                 aes(x = x1, y = y1, xend = x2, yend = y2),
+                 arrow = arrow(length = unit(0.12, "cm"), type = "closed"),
+                 color = "gray20", size = 0.8) +
+    
+    # Stage 2 arrows
+    geom_segment(data = arrows2,
+                 aes(x = x1, y = y1, xend = x2, yend = y2),
+                 arrow = arrow(length = unit(0.1, "cm"), type = "closed"),
+                 color = "gray40", size = 0.5) +
+    
+    # Stage 3 arrows
+    geom_segment(data = arrows3,
+                 aes(x = x1, y = y1, xend = x2, yend = y2),
+                 arrow = arrow(length = unit(0.1, "cm"), type = "closed"),
+                 color = "gray40", size = 0.5) +
+    
+    scale_fill_manual(values = colors) +
+    coord_cartesian(xlim = c(0.3, 7.7), ylim = c(3.8, 9)) +
+    theme_void() +
+    theme(
+      legend.position = "none",
+      plot.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(10, 10, 10, 10)
+    )
+  
+  return(p)
+}
+
+# Add methods annotation
+create_figure_with_methods <- function() {
+  p_main <- create_accurate_workflow()
+  
+  # Key methods details
+  methods_text <- textGrob(
+    paste(
+      "Stage 1 QC: nUMI ≥500, nGene ≥250, log10(nGene/nUMI) >0.80, mitoRatio <30%, genes expressed in ≥10 cells",
+      "  Normalization: NormalizeData → FindVariableFeatures (2000) → ScaleData → CellCycleScoring → PCA → SCTransform (glmGamPoi) → RunUMAP (30 dims)",
+      "Stage 2: Cell IDs harmonized with dataset prefix → MGI symbol to Ensembl via biomaRt → Common gene universe enforced across all 8 datasets → Re-run SCTransform (return.only.var.genes=FALSE)",
+      "Stage 3: SelectIntegrationFeatures (3000) → VariableFeatures assigned → PrepSCTIntegration → FindIntegrationAnchors (30 PCs, SCT) → IntegrateData → PCA/UMAP/FindNeighbors → FindClusters (res 0.1-0.9)",
+      sep = "\n"
+    ),
+    x = 0.02, hjust = 0, just = "left",
+    gp = gpar(fontsize = 7, fontfamily = "sans", lineheight = 1.3, col = "gray30")
+  )
+  
+  # Combine
+  layout <- rbind(
+    c(1, 1, 1),
+    c(1, 1, 1),
+    c(1, 1, 1),
+    c(2, 2, 2)
+  )
+  
+  g <- grid.arrange(
+    p_main,
+    methods_text,
+    layout_matrix = layout,
+    heights = c(2.5, 2.5, 2.5, 1.5),
+    top = textGrob("Cardiac Reference Atlas Integration Workflow", 
+                   gp = gpar(fontsize = 13, fontface = "bold"))
+  )
+  
+  return(g)
+}
+
+# Generate and save
+fig <- create_figure_with_methods()
+
+ggsave("cardiac_atlas_workflow_accurate.pdf", 
+       plot = fig, 
+       width = 9, 
+       height = 6.5, 
+       dpi = 600,
+       device = cairo_pdf)
+
+ggsave("cardiac_atlas_workflow_accurate.png", 
+       plot = fig, 
+       width = 9, 
+       height = 6.5, 
+       dpi = 600)
+
+ggsave("cardiac_atlas_workflow_accurate.tiff", 
+       plot = fig, 
+       width = 9, 
+       height = 6.5, 
+       dpi = 600,
+       compression = "lzw")
+
+# Version without methods text
+p_clean <- create_accurate_workflow() +
+  ggtitle("Cardiac Reference Atlas Integration Workflow") +
+  theme(plot.title = element_text(hjust = 0.5, size = 13, face = "bold",
+                                   margin = margin(b = 10)))
+
+ggsave("cardiac_atlas_workflow_clean.pdf", 
+       plot = p_clean, 
+       width = 9, 
+       height = 4.5, 
+       dpi = 600,
+       device = cairo_pdf)
+
+ggsave("cardiac_atlas_workflow_clean.png", 
+       plot = p_clean, 
+       width = 9, 
+       height = 4.5, 
+       dpi = 600)
+
+
+```
+
+
+
+
+
+
+
+
+
+
