@@ -1,0 +1,467 @@
+---
+title: "Immune Classifier, Step 6: Final Validation on Held-Out Cells"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2026-03-06"
+output: html_document
+---
+
+```{r final-validation}
+
+# Phase 6: Final Validation
+# Cardiac Immune Classifier
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SingleR)
+  library(scuttle)   
+  library(SingleCellExperiment)
+  library(dplyr)
+  library(tidyr)
+  library(yaml)
+  library(ggplot2)
+  library(class)
+  library(caret)
+  library(pROC)
+  library(reshape2)
+  library(gridExtra)
+  library(here)
+})
+
+# Configuration
+cat("Phase 6: Final Validation\n")
+
+# Load config
+config_path <- here::here("config", "config.yaml")
+config <- yaml::read_yaml(config_path)
+
+
+# Load Validation Set
+cat("\n[1/8] Loading validation set (blind holdout)...\n")
+
+atlas_ref_path <- here::here(config$paths$atlas_reference)
+seurat_atlas <- readRDS(atlas_path)
+
+# Extract held-out validation set
+val_cells <- colnames(seurat_atlas)[seurat_atlas$split == "validation"]
+val_atlas <- seurat_atlas[, val_cells]
+
+cat(sprintf("Validation set: %s cells across %d cell types\n",
+            format(ncol(val_atlas), big.mark = ","),
+            length(unique(val_atlas$cell_type))))
+
+# Load Best Hyperparameters
+cat("\n[2/8] Loading optimal hyperparameters from Phase 5...\n")
+
+best_params <- readRDS(
+  file.path(config$paths$results_dir, "models", "best_hyperparameters.rds")
+)
+
+best_k <- best_params$best_k
+best_ratio <- best_params$best_smote_ratio
+best_f1_test <- best_params$best_weighted_f1
+
+cat(sprintf("Best k: %d\n", best_k))
+cat(sprintf("Best SMOTE ratio: %s\n", best_ratio))
+cat(sprintf("Test set F1: %.4f\n", best_f1_test))
+
+# Load best training dataset
+ratio_clean <- gsub(":", "_", best_ratio)
+train_path <- file.path(
+  config$paths$data_dir, "processed", "smote_balanced",
+  paste0("train_smote_", ratio_clean, ".rds")
+)
+train_atlas <- readRDS(train_path)
+
+cat(sprintf("Loaded training set: %s cells\n",
+            format(ncol(train_atlas), big.mark = ",")))
+
+# Apply k-NN Classifier with Probabilities
+cat("\n[3/8] Running k-NN classifier with probability scores...\n")
+
+# Extract PCA coordinates
+train_pca <- Embeddings(train_atlas, reduction = "pca")[, 1:50]
+train_labels <- train_atlas$cell_type
+val_pca <- Embeddings(val_atlas, reduction = "pca")[, 1:50]
+val_labels <- val_atlas$cell_type
+
+# Ensure consistent factor levels
+all_levels <- sort(unique(c(as.character(train_labels), as.character(val_labels))))
+train_labels <- factor(train_labels, levels = all_levels)
+val_labels <- factor(val_labels, levels = all_levels)
+
+# Run k-NN with probabilities
+predictions <- knn(
+  train = train_pca,
+  test = val_pca,
+  cl = train_labels,
+  k = best_k,
+  prob = TRUE  
+)
+
+# Extract probabilities 
+winner_prob <- attr(predictions, "prob")
+max_probability <- winner_prob
+predictions <- factor(predictions, levels = all_levels)
+
+cat(sprintf("Predictions complete (k=%d)\n", best_k))
+
+#Calculate Nearest Neighbor Distance
+cat("\n[4/8] Computing nearest neighbor distances...\n")
+
+# For each validation cell, find distance to nearest training cell
+nn_distances <- numeric(nrow(val_pca))
+
+for (i in 1:nrow(val_pca)) {
+  # Calculate Euclidean distance to all training cells
+  distances <- sqrt(rowSums((train_pca - rep(val_pca[i, ], each = nrow(train_pca)))^2))
+  nn_distances[i] <- min(distances)
+}
+
+
+
+cat("KNN distances computed\n")
+
+# Flag Unassigned Cells
+cat("\n[5/8] Identifying unassigned/low-confidence cells...\n")
+
+prob_threshold <- config$user_query$probability_threshold
+
+# Flag cells with low confidence
+unassigned <- max_probability < prob_threshold
+
+cat(sprintf("  Probability threshold: %.2f\n", prob_threshold))
+cat(sprintf("  Unassigned cells: %d (%.1f%%)\n",
+            sum(unassigned),
+            100 * sum(unassigned) / length(unassigned)))
+
+# Create unassigned cells dataframe
+unassigned_df <- data.frame(
+  cell_id = colnames(val_atlas)[unassigned],
+  true_label = as.character(val_labels[unassigned]),
+  predicted_label = as.character(predictions[unassigned]),
+  max_probability = max_probability[unassigned],
+  nn_distance = nn_distances[unassigned],
+  stringsAsFactors = FALSE
+)
+
+# Run atlas-reference SingleR on validation set
+cat("\n[6/8] Running ImmGen for comparison...\n")
+
+# Load atlas SingleR reference
+atlas_ref_path <- "/projects/b1246/Isaac/atlas_reference.rds"
+
+if (!file.exists(atlas_ref_path)) {
+  cat("Atlas reference not found, skipping ImmGen comparison\n")
+  run_immgen <- FALSE
+} else {
+  run_immgen <- TRUE
+  
+  atlas_reference <- readRDS(atlas_ref_path)
+  
+  # Convert validation set to SCE
+  val_counts <- GetAssayData(val_atlas, assay = "SCT", layer = "counts")
+  val_sce <- SingleCellExperiment(assays = list(counts = val_counts))
+  val_sce <- logNormCounts(val_sce)
+  
+gene_map <- read.csv(here::here(config$paths$gene_map), stringsAsFactors = FALSE)
+
+  cat(sprintf("Loaded gene map: %d entries\n", nrow(gene_map)))
+  
+  # Convert val_sce rownames from Ensembl to symbols
+  val_genes_ensembl <- rownames(val_sce)
+  
+  # Match Ensembl IDs to symbols
+  gene_map_match <- gene_map[match(val_genes_ensembl, gene_map$ensembl_gene_id), ]
+  
+  # Keep only genes that have a match
+  valid_idx <- !is.na(gene_map_match$mgi_symbol)
+  val_sce <- val_sce[valid_idx, ]
+  
+  # Rename with symbols
+  rownames(val_sce) <- gene_map_match$mgi_symbol[valid_idx]
+  
+  cat(sprintf("Converted %d genes to symbols\n", sum(valid_idx)))
+  
+  # Find common genes
+  common_genes <- intersect(rownames(val_sce), rownames(atlas_reference))
+  
+  cat(sprintf("Common genes: %d\n", length(common_genes)))
+  
+  if (length(common_genes) < 100) {
+    cat("Too few common genes, skipping ImmGen comparison\n")
+    run_immgen <- FALSE
+  } else {
+    # Subset both to common genes
+    val_sce <- val_sce[common_genes, ]
+    atlas_reference <- atlas_reference[common_genes, ]
+    
+    # Run SingleR
+    cat("Running SingleR annotation...\n")
+    immgen_pred <- SingleR(
+      test = val_sce,
+      ref = atlas_reference,
+      labels = colnames(atlas_reference)
+    )
+    
+    immgen_predictions <- factor(immgen_pred$labels, levels = all_levels)
+    
+    cat("ImmGen predictions complete\n")
+  }
+}
+
+# Calculate Metrics for Both Classifiers
+cat("\n[7/8] Computing performance metrics...\n")
+
+# Classifier
+our_conf_matrix <- confusionMatrix(
+  data = predictions[!unassigned],  # Exclude unassigned
+  reference = val_labels[!unassigned]
+)
+
+our_per_class <- our_conf_matrix$byClass
+if (is.null(dim(our_per_class))) {
+  our_per_class <- t(as.matrix(our_per_class))
+}
+
+# Fix class names (remove "Class: " prefix)
+our_f1 <- our_per_class[, "F1"]
+names(our_f1) <- gsub("Class: ", "", rownames(our_per_class))
+our_precision <- our_per_class[, "Precision"]
+names(our_precision) <- gsub("Class: ", "", rownames(our_per_class))
+our_recall <- our_per_class[, "Recall"]
+names(our_recall) <- gsub("Class: ", "", rownames(our_per_class))
+
+# Calculate weighted F1
+val_class_counts <- table(val_labels[!unassigned])
+val_class_weights <- val_class_counts / sum(val_class_counts)
+cell_types_in_val <- names(val_class_counts)
+our_f1_aligned <- our_f1[cell_types_in_val]
+our_f1_aligned[is.na(our_f1_aligned)] <- 0
+our_weighted_f1 <- sum(our_f1_aligned * as.numeric(val_class_weights), na.rm = TRUE)
+
+cat(sprintf("\nClassifier:\n"))
+cat(sprintf("Weighted F1: %.4f\n", our_weighted_f1))
+cat(sprintf("Accuracy: %.4f\n", our_conf_matrix$overall["Accuracy"]))
+
+# Atlas SingleR
+if (run_immgen) {
+  immgen_conf_matrix <- confusionMatrix(
+    data = immgen_predictions,
+    reference = val_labels
+  )
+  
+  immgen_per_class <- immgen_conf_matrix$byClass
+  if (is.null(dim(immgen_per_class))) {
+    immgen_per_class <- t(as.matrix(immgen_per_class))
+  }
+  
+  immgen_f1 <- immgen_per_class[, "F1"]
+  names(immgen_f1) <- gsub("Class: ", "", rownames(immgen_per_class))
+  immgen_precision <- immgen_per_class[, "Precision"]
+  names(immgen_precision) <- gsub("Class: ", "", rownames(immgen_per_class))
+  immgen_recall <- immgen_per_class[, "Recall"]
+  names(immgen_recall) <- gsub("Class: ", "", rownames(immgen_per_class))
+  
+  immgen_f1_aligned <- immgen_f1[cell_types_in_val]
+  immgen_f1_aligned[is.na(immgen_f1_aligned)] <- 0
+  immgen_weighted_f1 <- sum(immgen_f1_aligned * as.numeric(val_class_weights), na.rm = TRUE)
+  
+  cat(sprintf("\nImmGen:\n"))
+  cat(sprintf("Weighted F1: %.4f\n", immgen_weighted_f1))
+  cat(sprintf("Accuracy: %.4f\n", immgen_conf_matrix$overall["Accuracy"]))
+}
+
+# Generate Visualizations
+cat("\n[8/8] Generating publication figures...\n")
+
+results_dir <- file.path(config$paths$results_dir, "figures", "phase6_validation")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Figure 1: F1 Comparison
+if (run_immgen) {
+  comparison_df <- data.frame(
+    Cell_Type = names(our_f1),
+    Classifier = our_f1,
+    ImmGen = immgen_f1[names(our_f1)]
+  ) %>%
+    pivot_longer(cols = c(Classifier, ImmGen),
+                 names_to = "Method",
+                 values_to = "F1") %>%
+    mutate(F1 = ifelse(is.na(F1), 0, F1))
+  
+  p_f1_comparison <- ggplot(comparison_df, aes(x = Cell_Type, y = F1, fill = Method)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    scale_fill_manual(values = c("Classifier" = "#2E7D32", "ImmGen" = "#D32F2F"),
+                  labels = c("Classifier" = "Classifier", "ImmGen" = "Atlas SingleR"))  +
+    coord_flip() +
+    labs(
+      title = "Cell Type Classification Performance: Classifier vs Atlas SingleR",
+      subtitle = sprintf("Validation Set (n=%s cells)", format(ncol(val_atlas), big.mark=",")),
+      x = "Cell Type",
+      y = "F1 Score",
+      fill = "Method"
+    ) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text.y = element_text(size = 9),
+      legend.position = "bottom"
+    )
+  
+  ggsave(
+    filename = file.path(results_dir, "phase6_F1_comparison.png"),
+    plot = p_f1_comparison,
+    width = 12, height = 10, dpi = 300
+  )
+  
+  cat("Saved F1 comparison\n")
+}
+
+# Figure 2: Confusion Matrices 
+# classifier
+conf_df_ours <- as.data.frame(our_conf_matrix$table)
+p_conf_ours <- ggplot(conf_df_ours, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 2.5) +
+  scale_fill_gradient(low = "white", high = "#2E7D32", name = "Count") +
+  labs(
+    title = sprintf("Classifier (F1=%.4f)", our_weighted_f1),
+    x = "True Label",
+    y = "Predicted Label"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 7)
+  )
+
+ggsave(
+  filename = file.path(results_dir, "phase6_confusion_matrix_ours.png"),
+  plot = p_conf_ours,
+  width = 12, height = 10, dpi = 300
+)
+
+if (run_immgen) {
+  conf_df_immgen <- as.data.frame(immgen_conf_matrix$table)
+  p_conf_immgen <- ggplot(conf_df_immgen, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Freq), color = "black", size = 2.5) +
+    scale_fill_gradient(low = "white", high = "#D32F2F", name = "Count") +
+    labs(
+      title = sprintf("Atlas SingleR (F1=%.4f)", immgen_weighted_f1),
+      x = "True Label",
+      y = "Predicted Label"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      axis.text.y = element_text(size = 7)
+    )
+  
+  ggsave(
+    filename = file.path(results_dir, "phase6_confusion_matrix_atlas_singler.png"),
+    plot = p_conf_immgen,
+    width = 12, height = 10, dpi = 300
+  )
+}
+
+cat("Saved confusion matrices\n")
+
+#Figure 3: Confidence Landscape
+confidence_df <- data.frame(
+  max_probability = max_probability,
+  nn_distance = nn_distances,
+  assigned = ifelse(unassigned, "Unassigned", "Assigned"),
+  correct = predictions == val_labels
+)
+
+p_confidence <- ggplot(confidence_df, aes(x = max_probability, y = nn_distance, color = assigned)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  scale_color_manual(values = c("Assigned" = "#2E7D32", "Unassigned" = "#D32F2F")) +
+  geom_vline(xintercept = prob_threshold, linetype = "dashed", color = "black") +
+  labs(
+    title = "Classifier Confidence Landscape",
+    subtitle = sprintf("Threshold: %.2f | Unassigned: %d cells (%.1f%%)",
+                      prob_threshold, sum(unassigned), 100*sum(unassigned)/length(unassigned)),
+    x = "k-NN vote fraction",
+    y = "Nearest Neighbor Distance",
+    color = "Status"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+ggsave(
+  filename = file.path(results_dir, "phase6_confidence_landscape.png"),
+  plot = p_confidence,
+  width = 10, height = 7, dpi = 300
+)
+
+
+# Save Results
+cat("\nSaving results...\n")
+
+metrics_dir <- file.path(config$paths$results_dir, "metrics")
+
+# Per-cell-type metrics
+if (run_immgen) {
+  metrics_df <- data.frame(
+    Cell_Type = names(our_f1),
+    Classifier_Precision = our_precision,
+    Classifier_Recall = our_recall,
+    Classifier_F1 = our_f1,
+    AtlasSingleR_Precision = immgen_precision[names(our_f1)],
+    AtlasSingleR_Recall = immgen_recall[names(our_f1)],
+    ImmGen_F1 = AtlasSingleR_F1 = immgen_f1[names(our_f1)]
+  )
+} else {
+  metrics_df <- data.frame(
+    Cell_Type = names(our_f1),
+    Classifier_Precision = our_precision,
+    Classifier_Recall = our_recall,
+    Classifier_F1 = our_f1
+  )
+}
+
+write.csv(
+  metrics_df,
+  file = file.path(metrics_dir, "phase6_final_metrics.csv"),
+  row.names = FALSE
+)
+
+# Unassigned cells
+write.csv(
+  unassigned_df,
+  file = file.path(metrics_dir, "phase6_unassigned_cells.csv"),
+  row.names = FALSE
+)
+
+
+# Summary
+cat("Phase 6 Complete: Final Validation\n")
+
+cat("Summary:\n")
+cat(sprintf("Validation cells: %s\n", format(ncol(val_atlas), big.mark = ",")))
+cat(sprintf("Classifier Weighted F1: %.4f\n", our_weighted_f1))
+if (run_immgen) {
+  cat(sprintf("ImmGen Weighted F1: %.4f\n", immgen_weighted_f1))
+  cat(sprintf("Improvement: +%.4f (%.1f%%)\n",
+              our_weighted_f1 - immgen_weighted_f1,
+              100 * (our_weighted_f1 - immgen_weighted_f1) / immgen_weighted_f1))
+}
+cat(sprintf("Unassigned cells: %d (%.1f%%)\n",
+            sum(unassigned), 100*sum(unassigned)/length(unassigned)))
+
+cat("\nPublication figures saved to:\n")
+cat(sprintf("  %s\n", results_dir))
+
+
+```
+=
