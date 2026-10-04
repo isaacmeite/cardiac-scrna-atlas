@@ -1,0 +1,463 @@
+---
+ttitle: "Immune Classifier, Step 5: Hyperparameter Tuning"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2026-03-06"
+output: html_document
+---
+
+```{r hyperparameter-tuning}
+
+# Phase 5: Hyperparameter Tuning
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(yaml)
+  library(ggplot2)
+  library(class)      
+  library(caret)      
+  library(reshape2) 
+  library(here)
+})
+
+#Configuration
+cat("Phase 5: Hyperparameter Tuning\n")
+
+# Load config
+config_path <- here::here("config", "config.yaml")
+config <- yaml::read_yaml(config_path)
+
+cat("Configuration loaded\n")
+
+# Load Atlas with Splits
+cat("\n[1/6] Loading atlas with splits...\n")
+
+atlas_path <- file.path(config$paths$data_dir, "processed", "atlas_with_splits.rds")
+if (!file.exists(atlas_path)) {
+  stop("Atlas with splits not found. Run Phase 3 first: ", atlas_path)
+}
+
+seurat_atlas <- readRDS(atlas_path)
+
+# Extract test set 
+test_cells <- colnames(seurat_atlas)[seurat_atlas$split == "test"]
+test_atlas <- seurat_atlas[, test_cells]
+
+cat(sprintf("Test set: %s cells\n", format(ncol(test_atlas), big.mark = ",")))
+
+# Load Balanced Training Datasets 
+cat("\n[2/6] Loading SMOTE-balanced training datasets...\n")
+
+smote_dir <- file.path(config$paths$data_dir, "processed", "smote_balanced")
+ratios <- config$smote$ratios_to_test
+balanced_datasets <- list()
+
+for (ratio in ratios) {
+  ratio_clean <- gsub(":", "_", ratio)
+  file_path <- file.path(smote_dir, paste0("train_smote_", ratio_clean, ".rds"))
+  
+  if (!file.exists(file_path)) {
+    stop("Balanced dataset not found: ", file_path, "\nRun Phase 4 first.")
+  }
+  
+  balanced_datasets[[ratio]] <- readRDS(file_path)
+  
+  n_real <- sum(!balanced_datasets[[ratio]]$synthetic)
+  n_synthetic <- sum(balanced_datasets[[ratio]]$synthetic)
+  
+  cat(sprintf("Ratio %s: %d real + %d synthetic = %d total\n",
+              ratio, n_real, n_synthetic, n_real + n_synthetic))
+}
+
+#k-NN Training & Evaluation Function
+cat("\n[3/6] Defining k-NN evaluation function...\n")
+
+evaluate_knn <- function(train_data, test_data, k_value) {
+  
+  # Extract PCA coordinates for training (first 50 PCs)
+  train_pca <- Embeddings(train_data, reduction = "pca")[, 1:50]
+  train_labels <- train_data$cell_type
+  
+  # Extract PCA coordinates for testing
+  test_pca <- Embeddings(test_data, reduction = "pca")[, 1:50]
+  test_labels <- test_data$cell_type
+  
+  # Ensure labels are factors with same levels
+  all_levels <- sort(unique(c(as.character(train_labels), as.character(test_labels))))
+  train_labels <- factor(train_labels, levels = all_levels)
+  test_labels <- factor(test_labels, levels = all_levels)
+  
+  # Predict on test set using Euclidean distance
+  predictions <- knn(
+    train = train_pca,
+    test = test_pca,
+    cl = train_labels,
+    k = k_value
+  )
+  
+  # Ensure predictions are factor with same levels
+  predictions <- factor(predictions, levels = all_levels)
+  
+  # Calculate confusion matrix
+  conf_matrix <- confusionMatrix(
+    data = predictions,
+    reference = test_labels
+  )
+  
+  # Extract metrics
+  overall_accuracy <- conf_matrix$overall["Accuracy"]
+  
+  # Per-class metrics
+  per_class <- conf_matrix$byClass
+  
+  # Handle single class case
+  if (is.null(dim(per_class))) {
+    per_class <- t(as.matrix(per_class))
+    rownames(per_class) <- all_levels[1]
+  }
+  
+  # Calculate weighted F1
+  test_class_counts <- table(test_labels)
+  test_class_weights <- test_class_counts / sum(test_class_counts)
+  
+  # Extract F1 scores
+  f1_scores <- per_class[, "F1"]
+  
+  names(f1_scores) <- gsub("Class: ", "", rownames(per_class))
+  
+  # Replace NAs with 0
+  f1_scores[is.na(f1_scores)] <- 0
+  
+  # Get cell types that appear in test set
+  cell_types_in_test <- names(test_class_counts)
+  
+  # Align F1 scores with test set weights
+  f1_aligned <- f1_scores[cell_types_in_test]
+  weights_aligned <- as.numeric(test_class_weights[cell_types_in_test])
+  
+  # Handle any NAs from alignment
+  f1_aligned[is.na(f1_aligned)] <- 0
+  
+  # Calculate weighted F1
+  weighted_f1 <- sum(f1_aligned * weights_aligned, na.rm = TRUE)
+  
+  return(list(
+    confusion_matrix = conf_matrix,
+    weighted_f1 = weighted_f1,
+    overall_accuracy = overall_accuracy,
+    per_class_metrics = per_class,
+    predictions = predictions
+  ))
+}
+
+cat("k-NN evaluation function defined\n")
+
+# Hyperparameter Grid Search
+cat("\n[4/6] Running hyperparameter grid search...\n")
+
+k_values <- config$knn$k_values_to_test
+
+# Initialize results storage
+results_grid <- expand.grid(
+  SMOTE_Ratio = ratios,
+  k_value = k_values,
+  stringsAsFactors = FALSE
+)
+results_grid$weighted_f1 <- NA
+results_grid$accuracy <- NA
+
+# Store detailed results
+detailed_results <- list()
+
+# Progress counter
+total_combinations <- nrow(results_grid)
+current_combination <- 0
+
+cat(sprintf("\n  Testing %d combinations (%d SMOTE ratios × %d k values)\n\n",
+            total_combinations, length(ratios), length(k_values)))
+
+for (i in 1:nrow(results_grid)) {
+  ratio <- results_grid$SMOTE_Ratio[i]
+  k <- results_grid$k_value[i]
+  
+  current_combination <- current_combination + 1
+  
+  cat(sprintf("  [%d/%d] SMOTE %s, k=%d...",
+              current_combination, total_combinations, ratio, k))
+  
+  # Get training data for this SMOTE ratio
+  train_data <- balanced_datasets[[ratio]]
+  
+  # Evaluate k-NN
+  eval_result <- evaluate_knn(train_data, test_atlas, k)
+  
+  # Store results
+  results_grid$weighted_f1[i] <- eval_result$weighted_f1
+  results_grid$accuracy[i] <- eval_result$overall_accuracy
+  
+  # Store detailed results
+  combo_name <- paste0("smote_", gsub(":", "_", ratio), "_k", k)
+  detailed_results[[combo_name]] <- eval_result
+  
+  cat(sprintf(" F1=%.4f, Acc=%.4f\n",
+              eval_result$weighted_f1,
+              eval_result$overall_accuracy))
+}
+
+cat("\nGrid search complete\n")
+
+# Select Best Hyperparameters
+cat("\n[5/6] Selecting best hyperparameters...\n")
+
+# Find best combination
+best_idx <- which.max(results_grid$weighted_f1)
+best_ratio <- results_grid$SMOTE_Ratio[best_idx]
+best_k <- results_grid$k_value[best_idx]
+best_f1 <- results_grid$weighted_f1[best_idx]
+best_acc <- results_grid$accuracy[best_idx]
+
+
+cat("  BEST HYPERPARAMETERS:\n")
+
+cat(sprintf("  • SMOTE Ratio: %s\n", best_ratio))
+cat(sprintf("  • k value: %d\n", best_k))
+cat(sprintf("  • Weighted F1: %.4f\n", best_f1))
+cat(sprintf("  • Accuracy: %.4f\n", best_acc))
+
+
+# Visualize Results
+cat("\n[6/6] Generating visualizations...\n")
+
+results_dir <- file.path(config$paths$results_dir, "figures", "phase5_tuning")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Heatmap of F1 scores
+results_matrix <- results_grid %>%
+  select(SMOTE_Ratio, k_value, weighted_f1) %>%
+  pivot_wider(names_from = k_value, values_from = weighted_f1) %>%
+  as.data.frame()
+
+rownames(results_matrix) <- results_matrix$SMOTE_Ratio
+results_matrix$SMOTE_Ratio <- NULL
+results_matrix <- as.matrix(results_matrix)
+
+# Melt for ggplot
+results_melted <- melt(results_matrix)
+colnames(results_melted) <- c("SMOTE_Ratio", "k_value", "F1_Score")
+
+p_heatmap <- ggplot(results_melted, aes(x = factor(k_value), y = SMOTE_Ratio, fill = F1_Score)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.3f", F1_Score)), color = "black", size = 4) +
+  scale_fill_gradient2(
+    low = "#d73027",
+    mid = "#fee08b",
+    high = "#1a9850",
+    midpoint = median(results_melted$F1_Score, na.rm = TRUE),
+    name = "Weighted\nF1 Score"
+  ) +
+  labs(
+    title = "Hyperparameter Tuning: Weighted F1 Scores",
+    subtitle = sprintf("Best: SMOTE %s, k=%d (F1=%.4f)", best_ratio, best_k, best_f1),
+    x = "k value",
+    y = "SMOTE Ratio"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text = element_text(size = 10),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = file.path(results_dir, "hyperparameter_heatmap.png"),
+  plot = p_heatmap,
+  width = 10, height = 6, dpi = 300
+)
+
+
+# Line plot showing trends
+p_lines <- ggplot(results_grid, aes(x = k_value, y = weighted_f1, color = SMOTE_Ratio, group = SMOTE_Ratio)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("1:3" = "#e41a1c", "1:2" = "#377eb8", "1:1" = "#4daf4a")) +
+  labs(
+    title = "F1 Score vs k Value by SMOTE Ratio",
+    x = "k value",
+    y = "Weighted F1 Score",
+    color = "SMOTE Ratio"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = file.path(results_dir, "f1_by_k_and_smote.png"),
+  plot = p_lines,
+  width = 10, height = 6, dpi = 300
+)
+
+cat("Saved line plot\n")
+
+# Confusion matrix for best model
+best_combo_name <- paste0("smote_", gsub(":", "_", best_ratio), "_k", best_k)
+best_conf_matrix <- detailed_results[[best_combo_name]]$confusion_matrix
+
+# Plot confusion matrix
+conf_matrix_df <- as.data.frame(best_conf_matrix$table)
+
+p_conf <- ggplot(conf_matrix_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 3) +
+  scale_fill_gradient(low = "white", high = "#2E7D32", name = "Count") +
+  labs(
+    title = sprintf("Confusion Matrix: Best Model (SMOTE %s, k=%d)", best_ratio, best_k),
+    x = "True Label",
+    y = "Predicted Label"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    axis.text.y = element_text(size = 8)
+  )
+
+ggsave(
+  filename = file.path(results_dir, "best_model_confusion_matrix.png"),
+  plot = p_conf,
+  width = 12, height = 10, dpi = 300
+)
+
+cat("Saved confusion matrix\n")
+
+# Save Results 
+cat("\nSaving results...\n")
+
+# Save grid search results
+metrics_dir <- file.path(config$paths$results_dir, "metrics")
+write.csv(
+  results_grid,
+  file = file.path(metrics_dir, "phase5_hyperparameter_grid.csv"),
+  row.names = FALSE
+)
+
+# Save best hyperparameters
+best_params <- list(
+  best_smote_ratio = best_ratio,
+  best_k = best_k,
+  best_weighted_f1 = best_f1,
+  best_accuracy = best_acc
+)
+
+saveRDS(
+  best_params,
+  file = file.path(config$paths$results_dir, "models", "best_hyperparameters.rds")
+)
+
+# Save detailed results
+saveRDS(
+  detailed_results,
+  file = file.path(config$paths$results_dir, "models", "detailed_tuning_results.rds")
+)
+
+
+#Summary
+
+cat("Summary:\n")
+cat(sprintf("  • Combinations tested: %d\n", total_combinations))
+cat(sprintf("  • Best SMOTE ratio: %s\n", best_ratio))
+cat(sprintf("  • Best k value: %d\n", best_k))
+cat(sprintf("  • Best weighted F1: %.4f\n", best_f1))
+cat(sprintf("  • Best accuracy: %.4f\n", best_acc))
+cat(sprintf("  • Results saved to: %s\n", results_dir))
+
+cat("Run Phase 6: Final Validation (src/06_final_validation.R)\n\n")
+
+
+```
+
+```{r}
+
+# Confusion matrices for the top 5 combinations
+library(ggplot2)
+
+# Load detailed results
+detailed_results <- readRDS("/projects/b1246/Isaac/immune_classifier/results/models/detailed_tuning_results.rds")
+results_grid <- read.csv("/projects/b1246/Isaac/immune_classifier/results/metrics/phase5_hyperparameter_grid.csv")
+
+# Output directory
+output_dir <- "/projects/b1246/Isaac/immune_classifier/results/figures/phase5_tuning/top5_confusion_matrices"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Sort by weighted F1 and get top 5
+results_grid <- results_grid[order(-results_grid$weighted_f1), ]
+top5 <- results_grid[1:5, ]
+
+cat("Top 5 Hyperparameter Combinations:\n")
+print(top5[, c("SMOTE_Ratio", "k_value", "weighted_f1", "accuracy")])
+cat("\n")
+
+# Define 5 distinct color schemes
+color_schemes <- list(
+  list(low = "white", high = "#1a9850"),  
+  list(low = "white", high = "#2166ac"),  
+  list(low = "white", high = "#7570b3"),  
+  list(low = "white", high = "#d95f02"),  
+  list(low = "white", high = "#e7298a")   
+)
+
+# Generate confusion matrices for top 5
+for (i in 1:5) {
+  ratio <- top5$SMOTE_Ratio[i]
+  k <- top5$k_value[i]
+  f1 <- top5$weighted_f1[i]
+  acc <- top5$accuracy[i]
+  
+  combo_name <- paste0("smote_", gsub(":", "_", ratio), "_k", k)
+  
+  # Get confusion matrix
+  conf_matrix <- detailed_results[[combo_name]]$confusion_matrix
+  conf_matrix_df <- as.data.frame(conf_matrix$table)
+  
+  # Get color scheme for this rank
+  colors <- color_schemes[[i]]
+  
+  # Create plot
+  p <- ggplot(conf_matrix_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(color = "white", size = 0.5) +
+    geom_text(aes(label = Freq), color = "black", size = 2.5) +
+    scale_fill_gradient(low = colors$low, high = colors$high, name = "Count") +
+    labs(
+      title = sprintf("Rank #%d: SMOTE %s, k=%d", i, ratio, k),
+      subtitle = sprintf("Weighted F1: %.4f | Accuracy: %.4f", f1, acc),
+      x = "True Label",
+      y = "Predicted Label"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+      plot.subtitle = element_text(hjust = 0.5, size = 10),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      axis.text.y = element_text(size = 7),
+      legend.position = "right"
+    )
+  
+  # Save
+  filename <- sprintf("rank%d_confusion_matrix_smote_%s_k%02d.png", 
+                     i, gsub(":", "_", ratio), k)
+  ggsave(
+    filename = file.path(output_dir, filename),
+    plot = p,
+    width = 10, height = 8, dpi = 300
+  )
+  
+  cat(sprintf("Saved Rank #%d: SMOTE %s, k=%d (F1=%.4f) - Color: %s\n", 
+              i, ratio, k, f1, colors$high))
+}
+
+```
+
