@@ -1,0 +1,192 @@
+---
+title: "Immune Classifier, Step 2: Atlas PCA and Harmony Function"
+author: "Meite I, Pesce L, Feinstein M, Thorp EB, Lantz C"
+date: "2026-03-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+# Phase 2: Harmony Integration Framework
+# Cardiac Immune Classifier
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(dplyr)
+  library(yaml)
+  library(ggplot2)
+  library(here)
+})
+
+# Configuration
+cat("Phase 2: Harmony Integration Framework\n")
+
+# Load config
+config_path <- here::here("config", "config.yaml")
+config <- yaml::read_yaml(config_path)
+
+cat("Configuration loaded\n")
+
+# Load Processed Atlas
+cat("\n[1/5] Loading processed atlas...\n")
+
+atlas_path <- file.path(config$paths$data_dir, "processed", "atlas_processed.rds")
+if (!file.exists(atlas_path)) {
+  stop("Processed atlas not found. Run Phase 1 first: ", atlas_path)
+}
+
+seurat_atlas <- readRDS(atlas_path)
+
+cat(sprintf("Loaded atlas with %s cells and %s genes\n",
+            format(ncol(seurat_atlas), big.mark = ","),
+            format(nrow(seurat_atlas), big.mark = ",")))
+
+# Identify Variable Features
+cat("\n[2/5] Identifying variable features...\n")
+
+# Use the existing SCT assay
+DefaultAssay(seurat_atlas) <- "SCT"
+cat("  Using SCT assay (already normalized)\n")
+
+# SCT already has variable features, but let's ensure we have the right number
+if (length(VariableFeatures(seurat_atlas)) == 0) {
+  cat("  Finding variable features...\n")
+  seurat_atlas <- FindVariableFeatures(
+    seurat_atlas,
+    selection.method = "vst",
+    nfeatures = 3000
+  )
+}
+
+n_var_features <- length(VariableFeatures(seurat_atlas))
+cat(sprintf("Identified %d variable features\n", n_var_features))
+
+# Run PCA
+cat("\n[3/5] Running PCA...\n")
+
+n_pcs <- config$harmony$n_pcs
+
+cat(sprintf("  Computing %d principal components...\n", n_pcs))
+seurat_atlas <- RunPCA(
+  seurat_atlas,
+  features = VariableFeatures(seurat_atlas),
+  npcs = n_pcs,
+  verbose = FALSE
+)
+
+cat("PCA complete\n")
+
+# Variance explained
+pct_var <- (seurat_atlas@reductions$pca@stdev)^2 / 
+           sum((seurat_atlas@reductions$pca@stdev)^2) * 100
+
+cat(sprintf("  Variance explained by PC1-10: %.1f%%\n", sum(pct_var[1:10])))
+cat(sprintf("  Variance explained by PC1-30: %.1f%%\n", sum(pct_var[1:30])))
+cat(sprintf("  Variance explained by PC1-%d: %.1f%%\n", n_pcs, sum(pct_var[1:n_pcs])))
+
+# Visualize PCA
+cat("\n[4/5] Generating PCA visualizations...\n")
+
+results_dir <- file.path(config$paths$results_dir, "figures", "phase2_pca")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Elbow plot
+p_elbow <- ElbowPlot(seurat_atlas, ndims = n_pcs) +
+  ggtitle("PCA Elbow Plot") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(
+  filename = file.path(results_dir, "pca_elbow_plot.png"),
+  plot = p_elbow,
+  width = 8, height = 5, dpi = 300
+)
+
+cat("Saved elbow plot\n")
+
+# PCA plot colored by cell type
+p_pca <- DimPlot(
+  seurat_atlas,
+  reduction = "pca",
+  group.by = "cell_type",
+  dims = c(1, 2)
+) +
+  ggtitle("PCA: PC1 vs PC2 (by cell type)") +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+ggsave(
+  filename = file.path(results_dir, "pca_cell_types.png"),
+  plot = p_pca,
+  width = 10, height = 7, dpi = 300
+)
+
+cat(sprintf("Saved visualizations to: %s\n", results_dir))
+
+# Create Harmony Integration Function
+cat("\n[5/5] Creating Harmony integration function...\n")
+
+# Used in Phase 7 to integrate query data with the atlas
+harmonize_query_with_atlas <- function(
+  atlas_seurat,
+  query_seurat,
+  theta = 2,
+  dims_use = 1:50
+) {
+  
+  # Merge atlas and query
+  atlas_seurat$dataset <- "atlas"
+  query_seurat$dataset <- "query"
+  
+  combined <- merge(atlas_seurat, query_seurat)
+  
+  # Find variable features on combined data
+  combined <- FindVariableFeatures(combined, nfeatures = 3000)
+  
+  # Scale and run PCA
+  combined <- ScaleData(combined)
+  combined <- RunPCA(combined, npcs = max(dims_use), verbose = FALSE)
+  
+  # Run Harmony
+  combined <- RunHarmony(
+    combined,
+    group.by.vars = "dataset",
+    theta = theta,
+    dims.use = dims_use,
+    verbose = FALSE
+  )
+  
+  return(combined)
+}
+
+# Save the function for later use
+models_dir <- file.path(config$paths$results_dir, "models")
+dir.create(models_dir, recursive = TRUE, showWarnings = FALSE)
+
+saveRDS(
+  harmonize_query_with_atlas,
+  file = file.path(models_dir, "harmonize_function.rds")
+)
+
+cat("Harmony integration function saved\n")
+
+# Save Atlas with PCA
+cat("\nSaving atlas with PCA coordinates...\n")
+
+output_path <- file.path(config$paths$data_dir, "processed", "atlas_with_pca.rds")
+saveRDS(seurat_atlas, output_path)
+
+cat(sprintf("Saved to: %s\n", output_path))
+cat(sprintf("  File size: %.2f MB\n", file.size(output_path) / 1024^2))
+
+# Summary
+cat("Phase 2 Complete: Harmony Integration Framework\n")
+
+```
+
+
