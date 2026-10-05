@@ -27,7 +27,7 @@ This repository contains all analysis code for:
 - Construction of a curated 22-cell-type murine cardiac single-cell RNA sequencing atlas integrating 36,121 cells from 8 publicly available datasets
 - Training and validation of a cardiac-specific k-nearest neighbor immune classifier (weighted F1 = 0.87 vs 0.32 for ImmGen)
 - Pseudotime trajectory analysis of myeloid and stromal compartments using Monocle 3
-- Differential abundance and cell-cell communication analysis of MERTK knockout versus wild-type adult hearts at 7 days post-myocardial infarction using CellChat
+- Differential abundance and cell-cell communication analysis of *Mertk* knockout versus wild-type adult hearts at 7 days post-myocardial infarction using CellChat
 - Within-cell-type differential expression and pathway module scoring (KO vs WT)
 
 ---
@@ -72,12 +72,12 @@ Published datasets used in atlas construction are available under the following 
 - **E-MTAB-7895** - ArrayExpress
 - **GSE119355** - NCBI GEO
 
-Raw and processed single-cell RNA sequencing data for the Mertk-deficient and control adult mice generated in this study are deposited in the Gene Expression Omnibus (GEO) - [accession number will be provided at publication].
+Raw and processed single-cell RNA sequencing data for the *Mertk*-deficient and control adult mice generated in this study are deposited in the Gene Expression Omnibus (GEO) - [accession number will be provided at publication].
 
 Supplemental figures and tables are available at:  
 https://doi.org/10.6084/m9.figshare.33868957
 
-Large processed objects (integrated Seurat atlas, trained classifier model, CellChat WT/KO objects) will be hosted on Zenodo/Globus. Links will be added to this repository upon publication.
+Large processed objects are available on Zenodo: https://doi.org/10.5281/zenodo.23132607
 
 Any additional data are available from the corresponding authors upon reasonable request.
 
@@ -95,6 +95,8 @@ SingleR
 celldex
 monocle3
 CellChat >= 2.0
+caret
+sctransform
 scuttle
 scater
 glmGamPoi
@@ -119,6 +121,7 @@ Scripts should be run in the following order:
 4. `mertk_analysis/V2_Adult_Classification.Rmd`
 5. `mertk_analysis/V2_Immgen_v_Classifier.Rmd`
 
+To classify your own cardiac immune cells, use `classifier/07_user_query_classifier.Rmd` or source `classifier/classify_cardiac_immune.R` directly.
 Input paths in each script point to the Northwestern University Quest HPC cluster (`/projects/b1246/Isaac/`). Update these to match your local paths before running.
 
 ---
